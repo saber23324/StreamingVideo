@@ -33,7 +33,11 @@ from llava.conversation import conv_templates
 from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
 
-from streamingtom.audio_bottleneck import AudioConditionedBottleneck, BEATsAudioEncoder
+from streamingtom.audio_bottleneck import (
+    AudioConditionedBottleneck,
+    BEATsAudioEncoder,
+    batched_effective_rank,
+)
 from streamingtom.tasks.vision import VisionTask
 
 
@@ -64,6 +68,57 @@ def tensor_stats(tensor: torch.Tensor) -> Dict[str, object]:
     else:
         stats.update({"min": None, "max": None, "mean": None, "std": None, "max_abs": None})
     return stats
+
+
+def phase41_parameter_groups(adbt: AudioConditionedBottleneck):
+    """Return the disjoint parameter groups requested by Phase 4.1 diagnostics."""
+    generator = adbt.query_generator
+    groups = {
+        "query_tokens": [generator.query_tokens],
+        "audio_projection": list(generator.audio_projection.parameters()),
+        "audio_cross_attention": list(generator.audio_cross_attention.parameters()),
+        "time_projection": list(generator.time_projection.parameters()),
+        "visual_key": list(adbt.visual_key.parameters()),
+    }
+    if hasattr(generator, "slot_mlp"):
+        groups["slot_mlp"] = list(generator.slot_mlp.parameters())
+    return groups
+
+
+@torch.no_grad()
+def parameter_group_grad_norms(groups) -> Dict[str, float]:
+    """Compute true global L2 gradient norms for named parameter groups."""
+    norms = {}
+    for name, parameters in groups.items():
+        squared = sum(
+            float(parameter.grad.detach().float().square().sum().cpu())
+            for parameter in parameters
+            if parameter.grad is not None
+        )
+        norms[name] = math.sqrt(squared)
+    return norms
+
+
+@torch.no_grad()
+def snapshot_parameter_groups(groups):
+    """Snapshot small trainable groups only on diagnostic optimizer steps."""
+    return {
+        name: [parameter.detach().clone() for parameter in parameters]
+        for name, parameters in groups.items()
+    }
+
+
+@torch.no_grad()
+def parameter_group_update_norms(groups, snapshots) -> Dict[str, float]:
+    """Measure the exact L2 parameter displacement made by optimizer.step()."""
+    norms = {}
+    for name, parameters in groups.items():
+        squared = sum(
+            float((parameter.detach() - before).float().square().sum().cpu())
+            for parameter, before in zip(parameters, snapshots[name])
+        )
+        norms[name] = math.sqrt(squared)
+    return norms
 
 
 def save_debug_state(
@@ -184,6 +239,9 @@ def init_wandb(args, split, train_rows):
     run.define_metric("adbt_attention/*", step_metric="train/step")
     run.define_metric("adbt_query/*", step_metric="train/step")
     run.define_metric("adbt_qk/*", step_metric="train/step")
+    run.define_metric("adbt_rank/*", step_metric="train/step")
+    run.define_metric("adbt_grad/*", step_metric="train/step")
+    run.define_metric("adbt_update/*", step_metric="train/step")
     run.summary["train_rows"] = len(train_rows)
     run.summary["train_videos"] = len(split["train"])
     run.summary["test_videos"] = len(split["test"])
@@ -565,6 +623,15 @@ def train(args):
         if "optimizer" in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint["optimizer"])
+                if args.override_resume_learning_rate:
+                    restored_lrs = [group["lr"] for group in optimizer.param_groups]
+                    for group in optimizer.param_groups:
+                        group["lr"] = args.learning_rate
+                    LOGGER.info(
+                        "overrode resumed optimizer learning rates %s -> %.8g",
+                        restored_lrs,
+                        args.learning_rate,
+                    )
             except ValueError as exc:
                 # Adding latent normalization/scale changes the parameter
                 # group shape. Keep the adapter weights but start a fresh
@@ -582,6 +649,7 @@ def train(args):
     rows_by_video = {}
     for row in train_rows:
         rows_by_video.setdefault(str(row["videoID"]), []).append(row)
+    total_train_videos = len(rows_by_video)
     for epoch in range(resume_epoch, args.epochs):
         video_order = list(rows_by_video)
         random.Random(args.seed + epoch).shuffle(video_order)
@@ -603,7 +671,7 @@ def train(args):
             # the large frozen LLM activation graph is never accumulated three
             # times on the 80-GiB cards.
             for row in rows:
-                latents, _ = adbt(
+                latents, attention = adbt(
                     visual.float(),
                     audio_embeddings=audio["embeddings"].to(visual.device, dtype=torch.float32),
                     end_timestamps=audio["end_timestamps"].to(visual.device),
@@ -718,7 +786,45 @@ def train(args):
                         raise RuntimeError(f"ADBT received no finite gradient (norm={grad_norm})")
                     LOGGER.info("first-step ADBT gradient sum-norm=%.9e", grad_norm)
                 clipped_grad_norm = None
-                if (global_step + 1) % args.gradient_accumulation_steps == 0:
+                next_step = global_step + 1
+                optimizer_boundary = next_step % args.gradient_accumulation_steps == 0
+                log_modules = (
+                    args.module_log_every > 0
+                    and next_step % args.module_log_every == 0
+                    and optimizer_boundary
+                )
+                module_metrics = {}
+                group_snapshots = None
+                if log_modules:
+                    parameter_groups = phase41_parameter_groups(adbt)
+                    group_grad_norms = parameter_group_grad_norms(parameter_groups)
+                    group_snapshots = snapshot_parameter_groups(parameter_groups)
+                    module_metrics.update(
+                        {
+                            f"adbt_grad/{name}": value
+                            for name, value in group_grad_norms.items()
+                        }
+                    )
+                    audio_grad = math.sqrt(
+                        group_grad_norms["audio_projection"] ** 2
+                        + group_grad_norms["audio_cross_attention"] ** 2
+                    )
+                    module_metrics["adbt_grad/audio_to_visual_key_ratio"] = (
+                        audio_grad / max(group_grad_norms["visual_key"], 1e-30)
+                    )
+                rank_metrics = {}
+                if args.rank_log_every > 0 and next_step % args.rank_log_every == 0:
+                    attention_rank = batched_effective_rank(attention)
+                    latent_rank = batched_effective_rank(latents)
+                    rank_metrics = {
+                        "adbt_rank/attention_effective_mean": float(attention_rank.mean().cpu()),
+                        "adbt_rank/attention_effective_min": float(attention_rank.min().cpu()),
+                        "adbt_rank/attention_effective_max": float(attention_rank.max().cpu()),
+                        "adbt_rank/latent_effective_mean": float(latent_rank.mean().cpu()),
+                        "adbt_rank/latent_effective_min": float(latent_rank.min().cpu()),
+                        "adbt_rank/latent_effective_max": float(latent_rank.max().cpu()),
+                    }
+                if optimizer_boundary:
                     try:
                         clipped_grad_norm = float(
                             torch.nn.utils.clip_grad_norm_(
@@ -741,6 +847,23 @@ def train(args):
                         )
                         raise
                     optimizer.step()
+                    if group_snapshots is not None:
+                        group_update_norms = parameter_group_update_norms(
+                            parameter_groups, group_snapshots
+                        )
+                        module_metrics.update(
+                            {
+                                f"adbt_update/{name}": value
+                                for name, value in group_update_norms.items()
+                            }
+                        )
+                        audio_update = math.sqrt(
+                            group_update_norms["audio_projection"] ** 2
+                            + group_update_norms["audio_cross_attention"] ** 2
+                        )
+                        module_metrics["adbt_update/audio_to_visual_key_ratio"] = (
+                            audio_update / max(group_update_norms["visual_key"], 1e-30)
+                        )
                     optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 if wandb_run is not None and global_step % args.wandb_log_every == 0:
@@ -751,7 +874,7 @@ def train(args):
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
                         "train/epoch": epoch + 1,
                         "train/video_index": video_offset + video_idx + 1,
-                        "train/video_progress": (video_offset + video_idx + 1) / max(1, len(video_order)),
+                        "train/video_progress": current_video_index / max(1, total_train_videos),
                         "train/answer_tokens": int(answer_labels.numel()),
                         "adbt_latent/max": latent_stats["max"],
                         "adbt_latent/min": latent_stats["min"],
@@ -775,15 +898,35 @@ def train(args):
                     }
                     if clipped_grad_norm is not None:
                         metrics["train/grad_norm"] = clipped_grad_norm
+                    metrics.update(rank_metrics)
+                    metrics.update(module_metrics)
                     wandb_run.log(metrics, step=global_step)
+                if rank_metrics or module_metrics:
+                    LOGGER.info(
+                        "phase4.1 step=%d P_rank=%.3f Z_rank=%.3f grad_audio/key=%.6f "
+                        "update_audio/key=%.6f",
+                        global_step,
+                        rank_metrics.get("adbt_rank/attention_effective_mean", float("nan")),
+                        rank_metrics.get("adbt_rank/latent_effective_mean", float("nan")),
+                        module_metrics.get("adbt_grad/audio_to_visual_key_ratio", float("nan")),
+                        module_metrics.get("adbt_update/audio_to_visual_key_ratio", float("nan")),
+                    )
+                    if (
+                        wandb_run is not None
+                        and global_step % args.wandb_log_every != 0
+                    ):
+                        wandb_run.log(
+                            {"train/step": global_step, **rank_metrics, **module_metrics},
+                            step=global_step,
+                        )
             if global_step % args.log_every == 0:
                 mean_video_loss = video_loss_sum / max(1, video_loss_count)
                 LOGGER.info(
                     "epoch=%d video=%d/%d step=%d loss=%.5f entropy=%.4f "
                     "support=%.3f qcos=%.6f unique=%.2f gap=%.4f",
                     epoch,
-                    video_idx + 1,
-                    len(video_order),
+                    current_video_index,
+                    total_train_videos,
                     global_step,
                     mean_video_loss,
                     adbt_stats["attention_entropy_mean"],
@@ -812,6 +955,7 @@ def train(args):
                     frames,
                     timestamps,
                     latents,
+                    attention,
                     embeds,
                     labels,
                     mask,
@@ -952,6 +1096,18 @@ def parse_args():
     parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument(
+        "--rank-log-every",
+        type=int,
+        default=30,
+        help="Log effective ranks of attention P and latent Z every N question steps; 0 disables it.",
+    )
+    parser.add_argument(
+        "--module-log-every",
+        type=int,
+        default=30,
+        help="Log per-module gradient and optimizer-update norms every N question steps; 0 disables it.",
+    )
     parser.add_argument("--save-every-videos", type=int, default=20)
     parser.add_argument(
         "--eval-every-steps",
@@ -983,6 +1139,14 @@ def parse_args():
         help=(
             "Initialize adapter weights without restoring training progress. If only --num-queries "
             "changes, existing query slots are copied and new slots retain independent initialization."
+        ),
+    )
+    parser.add_argument(
+        "--override-resume-learning-rate",
+        action="store_true",
+        help=(
+            "After restoring optimizer state with --resume, replace each parameter-group "
+            "learning rate with --learning-rate while preserving optimizer moments."
         ),
     )
     parser.add_argument("--seed", type=int, default=1234)

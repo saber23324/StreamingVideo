@@ -2,7 +2,10 @@ import unittest
 
 import torch
 
-from streamingtom.audio_bottleneck.adbt import AudioConditionedBottleneck
+from streamingtom.audio_bottleneck.adbt import (
+    AudioConditionedBottleneck,
+    batched_effective_rank,
+)
 
 
 def make_native(num_queries: int = 8) -> AudioConditionedBottleneck:
@@ -19,6 +22,15 @@ def make_native(num_queries: int = 8) -> AudioConditionedBottleneck:
 
 
 class NativeValueADBTTest(unittest.TestCase):
+    def test_effective_rank_distinguishes_full_rank_rank_one_and_zero(self):
+        identity = torch.eye(8).unsqueeze(0)
+        rank_one = torch.ones(1, 8, 13)
+        zero = torch.zeros(1, 8, 13)
+
+        self.assertAlmostEqual(float(batched_effective_rank(identity)), 8.0, places=5)
+        self.assertLess(float(batched_effective_rank(rank_one)), 1.05)
+        self.assertEqual(float(batched_effective_rank(zero)), 0.0)
+
     def test_native_value_is_exact_probability_weighted_original_visual_tokens(self):
         torch.manual_seed(7)
         model = make_native().eval()

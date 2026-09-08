@@ -843,3 +843,5 @@ Phase 4 direct bottleneck，两者不是同一实验单元，不能作为正式 
 - real audio 在已完成的 Short+Medium zero ablation 中净少 2 题，说明下一轮
   首要问题已从“softmax/query 函数性死亡”转为“如何让纯 QA supervision 学会利用
   audio temporal variation”，而不是继续修改 value 路径或引入辅助 loss。
+
+

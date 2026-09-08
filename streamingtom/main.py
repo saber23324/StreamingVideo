@@ -34,6 +34,9 @@ class StreamingTOMConfig:
             'audio_bottleneck_latent_norm': os.getenv('AUDIO_BOTTLENECK_LATENT_NORM', default_latent_norm),
             'audio_bottleneck_architecture': os.getenv('AUDIO_BOTTLENECK_ARCHITECTURE', 'phase4'),
             'audio_bottleneck_temperature': float(os.getenv('AUDIO_BOTTLENECK_TEMPERATURE', '0.2')),
+            'audio_bottleneck_allow_temperature_override': os.getenv(
+                'AUDIO_BOTTLENECK_ALLOW_TEMPERATURE_OVERRIDE', '0'
+            ).lower() in {'1', 'true', 'yes', 'on'},
             'audio_window_seconds': float(os.getenv('AUDIO_WINDOW_SECONDS', '2.0')),
             'audio_sample_rate': int(os.getenv('AUDIO_SAMPLE_RATE', '16000')),
             'audio_ablation': os.getenv('AUDIO_ABLATION', 'real'),
@@ -72,6 +75,9 @@ class StreamingTOMConfig:
         assert self.config['audio_bottleneck_latent_norm'] in ['none', 'rmsnorm', 'layernorm']
         assert self.config['audio_bottleneck_architecture'] in ['legacy', 'phase4']
         assert self.config['audio_bottleneck_temperature'] > 0
+        assert isinstance(
+            self.config['audio_bottleneck_allow_temperature_override'], bool
+        )
         if self.config['audio_bottleneck_value_mode'] == 'native':
             assert self.config['audio_bottleneck_latent_norm'] == 'none', \
                 "native value mode requires AUDIO_BOTTLENECK_LATENT_NORM=none"

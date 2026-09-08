@@ -68,9 +68,18 @@ def setup_llava_with_streamingtom(model: nn.Module, streamingtom_config) -> nn.M
                     streamingtom_config.get('audio_bottleneck_temperature', 0.2)
                 )
                 if checkpoint_temperature != runtime_temperature:
-                    raise RuntimeError(
-                        'ADBT checkpoint temperature does not match runtime config: '
-                        f'checkpoint={checkpoint_temperature} runtime={runtime_temperature}'
+                    if not streamingtom_config.get(
+                        'audio_bottleneck_allow_temperature_override', False
+                    ):
+                        raise RuntimeError(
+                            'ADBT checkpoint temperature does not match runtime config: '
+                            f'checkpoint={checkpoint_temperature} runtime={runtime_temperature}. '
+                            'Set AUDIO_BOTTLENECK_ALLOW_TEMPERATURE_OVERRIDE=1 only for an '
+                            'explicit inference-only temperature sweep.'
+                        )
+                    print(
+                        '[StreamingTOM] inference-only temperature override: '
+                        f'checkpoint={checkpoint_temperature}, runtime={runtime_temperature}'
                     )
             checkpoint_value_mode = (
                 checkpoint_args.get('value_mode', 'projected')

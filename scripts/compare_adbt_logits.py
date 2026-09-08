@@ -32,6 +32,7 @@ from llava.conversation import conv_templates
 from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
 
+from streamingtom.audio_bottleneck import batched_effective_rank
 from streamingtom.main import streamingtom
 from streamingtom.models.llava.llava_streamingtom import create_frame_generator_llava
 from streamingtom.modules.streamingtom_context import StreamingTOMContext
@@ -262,6 +263,15 @@ def parse_args():
     parser.add_argument("--max-frames", type=int, default=32, help="0 uses official FPS without a cap")
     parser.add_argument("--vision-batch-size", type=int, default=16)
     parser.add_argument(
+        "--attention-temperature",
+        type=float,
+        default=None,
+        help=(
+            "Inference-only cosine temperature override. Supplying this flag "
+            "also enables the explicit checkpoint override guard."
+        ),
+    )
+    parser.add_argument(
         "--paths",
         choices=("all", "direct"),
         default="all",
@@ -281,6 +291,13 @@ def parse_args():
 def main():
     args = parse_args()
     os.environ["AUDIO_BOTTLENECK_CHECKPOINT"] = args.checkpoint
+    if args.attention_temperature is not None:
+        if args.attention_temperature <= 0:
+            raise ValueError("--attention-temperature must be > 0")
+        os.environ["AUDIO_BOTTLENECK_TEMPERATURE"] = str(
+            args.attention_temperature
+        )
+        os.environ["AUDIO_BOTTLENECK_ALLOW_TEMPERATURE_OVERRIDE"] = "1"
     model_name = get_model_name_from_path(args.pretrained)
     tokenizer, model, image_processor, _ = load_pretrained_model(
         args.pretrained,
@@ -310,6 +327,9 @@ def main():
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "duration": args.duration,
         "max_frames": args.max_frames,
+        "attention_temperature": float(
+            model.audio_bottleneck.attention_temperature
+        ),
         "paths": args.paths,
         "skip_logits": args.skip_logits,
         "option_token_ids": ids,
@@ -335,6 +355,8 @@ def main():
         top1_batches = []
         top2_batches = []
         query_cosine_batches = []
+        attention_rank_batches = []
+        latent_rank_batches = []
         with torch.inference_mode():
             for start in range(0, visual.shape[0], stream_batch_size):
                 end = min(start + stream_batch_size, visual.shape[0])
@@ -377,6 +399,10 @@ def main():
                 top1_batches.append(top_scores[..., 0].cpu())
                 top2_batches.append(top_scores[..., 1].cpu())
                 query_cosine_batches.append(query_cosine[:, off_diagonal].cpu())
+                attention_rank_batches.append(
+                    batched_effective_rank(attention).cpu()
+                )
+                latent_rank_batches.append(batched_effective_rank(latent).cpu())
 
         all_latents = torch.cat(latent_batches, dim=0)
         latent_cpu = all_latents.detach().float().cpu().contiguous()
@@ -399,6 +425,8 @@ def main():
         top2_scores = torch.cat(top2_batches).flatten()
         top1_minus_top2 = top1_scores - top2_scores
         query_cosines = torch.cat(query_cosine_batches).flatten()
+        attention_ranks = torch.cat(attention_rank_batches).flatten()
+        latent_ranks = torch.cat(latent_rank_batches).flatten()
         full_cache = None
         pipeline = None
         memory_id = f"diagnostic_{current_video}"
@@ -467,6 +495,15 @@ def main():
                 "max_query_cosine": float(query_cosines.max()),
                 "min_query_cosine": float(query_cosines.min()),
             },
+            "effective_rank": {
+                "definition": "exp(entropy(normalized_singular_values))",
+                "attention_mean": float(attention_ranks.mean()),
+                "attention_min": float(attention_ranks.min()),
+                "attention_max": float(attention_ranks.max()),
+                "latent_mean": float(latent_ranks.mean()),
+                "latent_min": float(latent_ranks.min()),
+                "latent_max": float(latent_ranks.max()),
+            },
             "full_kv_tokens": (
                 int(full_cache.get_seq_length()) if full_cache is not None else None
             ),
@@ -522,6 +559,8 @@ def main():
             top1_batches,
             top2_batches,
             query_cosine_batches,
+            attention_rank_batches,
+            latent_rank_batches,
             q_norms,
             k_norms,
             score_values,
@@ -529,6 +568,8 @@ def main():
             top2_scores,
             top1_minus_top2,
             query_cosines,
+            attention_ranks,
+            latent_ranks,
             latent_batches,
             visual,
             audio,

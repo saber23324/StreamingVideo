@@ -27,6 +27,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+@torch.no_grad()
+def batched_effective_rank(matrix: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    """Return entropy effective rank for each matrix in a batch.
+
+    The distribution is formed from singular values (not squared singular
+    values), so ``exp(H(s / sum(s)))`` is bounded by the slot dimension.  A
+    Gram eigendecomposition avoids materializing a costly full SVD for the
+    wide native visual latents ``[slots, 3584]``.
+    """
+    if matrix.dim() == 2:
+        matrix = matrix.unsqueeze(0)
+    if matrix.dim() != 3:
+        raise ValueError(
+            f"matrix must be [B,M,N] or [M,N], got {tuple(matrix.shape)}"
+        )
+    values = matrix.detach().float()
+    gram = torch.matmul(values, values.transpose(-1, -2))
+    singular_values = torch.linalg.eigvalsh(gram).clamp_min(0).sqrt()
+    totals = singular_values.sum(dim=-1, keepdim=True)
+    probabilities = singular_values / totals.clamp_min(eps)
+    entropy = -(
+        probabilities * probabilities.clamp_min(eps).log()
+    ).sum(dim=-1)
+    rank = entropy.exp()
+    return torch.where(totals.squeeze(-1) > eps, rank, torch.zeros_like(rank))
+
+
 class QueryTransformerBlock(nn.Module):
     """Small pre-norm Q-Former-style self-attention/FFN block."""
 
