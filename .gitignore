@@ -1,0 +1,9 @@
+# Django stuff:
+*.log
+*.pt
+wandb/
+
+results/
+LAVIS/
+unilm/
+*.pt
