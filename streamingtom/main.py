@@ -40,6 +40,7 @@ class StreamingTOMConfig:
             'audio_window_seconds': float(os.getenv('AUDIO_WINDOW_SECONDS', '2.0')),
             'audio_sample_rate': int(os.getenv('AUDIO_SAMPLE_RATE', '16000')),
             'audio_ablation': os.getenv('AUDIO_ABLATION', 'real'),
+            'audio_crossvideo_path': os.getenv('AUDIO_CROSSVIDEO_PATH', ''),
             'beats_checkpoint': os.getenv('BEATS_CHECKPOINT', ''),
             'beats_batch_size': int(os.getenv('BEATS_BATCH_SIZE', '8')),
             'audio_bottleneck_checkpoint': os.getenv('AUDIO_BOTTLENECK_CHECKPOINT', ''),
@@ -83,7 +84,12 @@ class StreamingTOMConfig:
                 "native value mode requires AUDIO_BOTTLENECK_LATENT_NORM=none"
         assert self.config['audio_window_seconds'] > 0
         assert self.config['audio_sample_rate'] == 16000, "BEATs expects 16 kHz audio"
-        assert self.config['audio_ablation'] in ['real', 'zero', 'shuffled', 'stale']
+        assert self.config['audio_ablation'] in [
+            'real', 'zero', 'shuffled', 'stale', 'crossvideo'
+        ]
+        if self.config['audio_ablation'] == 'crossvideo':
+            assert self.config['audio_crossvideo_path'], \
+                "AUDIO_CROSSVIDEO_PATH is required for crossvideo ablation"
 
         if self.config['audio_bottleneck_stage'] > 0 and self.config['audio_bottleneck_backend'] == 'oqm':
             assert self.config['audio_bottleneck_num_queries'] == self.config['oqm_group_size'], \

@@ -231,9 +231,17 @@ class BEATsAudioEncoder(nn.Module):
         end_timestamps: Iterable[float],
         device: torch.device,
         ablation: str = "real",
+        crossvideo_path: str = "",
     ) -> Dict[str, object]:
         timestamps = torch.as_tensor(list(end_timestamps), dtype=torch.float32)
-        waveform = self.decode_audio(video_path, self.sample_rate)
+        audio_source_path = str(video_path)
+        if ablation == "crossvideo":
+            if not crossvideo_path:
+                raise ValueError(
+                    "crossvideo ablation requires an explicit crossvideo_path"
+                )
+            audio_source_path = str(crossvideo_path)
+        waveform = self.decode_audio(audio_source_path, self.sample_rate)
         windows = self._causal_windows(waveform, timestamps)
         embeddings = self.encode_windows(windows, device=device)
 
@@ -244,7 +252,7 @@ class BEATsAudioEncoder(nn.Module):
             embeddings = embeddings[torch.randperm(embeddings.shape[0], generator=generator)]
         elif ablation == "stale" and embeddings.shape[0] > 1:
             embeddings = torch.cat([torch.zeros_like(embeddings[:1]), embeddings[:-1]], dim=0)
-        elif ablation != "real":
+        elif ablation not in ("real", "crossvideo"):
             raise ValueError(f"Unsupported audio ablation: {ablation}")
 
         return {
@@ -253,4 +261,6 @@ class BEATsAudioEncoder(nn.Module):
             "source": self.source,
             "window_seconds": self.window_seconds,
             "sample_rate": self.sample_rate,
+            "ablation": ablation,
+            "audio_source_path": audio_source_path,
         }

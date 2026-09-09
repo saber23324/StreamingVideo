@@ -165,7 +165,9 @@ def create_frame_generator_llava(video_input, config, audio_info=None) -> Iterat
 def _encode_audio_from_video(self, video_path, end_timestamps):
     """Encode only causal windows ending at the sampled visual timestamps."""
     timestamps = tuple(float(value) for value in end_timestamps)
-    cache_key = (str(video_path), timestamps)
+    ablation = self.streamingtom_config.get('audio_ablation', 'real')
+    crossvideo_path = self.streamingtom_config.get('audio_crossvideo_path', '')
+    cache_key = (str(video_path), timestamps, ablation, crossvideo_path)
     audio_cache = getattr(self, '_direct_audio_cache', None)
     if audio_cache is None:
         audio_cache = {}
@@ -180,7 +182,8 @@ def _encode_audio_from_video(self, video_path, end_timestamps):
         video_path,
         timestamps,
         device=device,
-        ablation=self.streamingtom_config.get('audio_ablation', 'real'),
+        ablation=ablation,
+        crossvideo_path=crossvideo_path,
     )
     # VideoMME has three questions per video.  Reusing causal BEATs embeddings
     # for those questions is exact and avoids decoding the same waveform three

@@ -34,9 +34,18 @@ from llava.mm_utils import get_model_name_from_path, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
 
 from streamingtom.audio_bottleneck import (
+    AVFeatureQueue,
     AudioConditionedBottleneck,
     BEATsAudioEncoder,
+    audio_visual_routing_contrastive_loss,
     batched_effective_rank,
+    counterfactual_qa_margin_loss,
+    counterfactual_teacher_kd_loss,
+    gradient_activation_importance,
+    teacher_routing_alignment_loss,
+    teacher_visual_feature_targets,
+    temporal_av_contrastive_loss,
+    visual_feature_distillation_loss,
 )
 from streamingtom.tasks.vision import VisionTask
 
@@ -242,6 +251,8 @@ def init_wandb(args, split, train_rows):
     run.define_metric("adbt_rank/*", step_metric="train/step")
     run.define_metric("adbt_grad/*", step_metric="train/step")
     run.define_metric("adbt_update/*", step_metric="train/step")
+    run.define_metric("phase5/*", step_metric="train/step")
+    run.define_metric("phase5_1/*", step_metric="train/step")
     run.summary["train_rows"] = len(train_rows)
     run.summary["train_videos"] = len(split["train"])
     run.summary["test_videos"] = len(split["test"])
@@ -326,6 +337,149 @@ def build_inputs(model, tokenizer, prompt_ids: torch.Tensor, answer: str, latent
     ).unsqueeze(0)
     attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=embed_device)
     return inputs_embeds, expanded_labels, attention_mask
+
+
+def option_token_ids(tokenizer) -> torch.Tensor:
+    """Return the single-token ids used by VideoMME answers A/B/C/D."""
+    ids = []
+    for letter in "ABCD":
+        encoded = tokenizer.encode(letter, add_special_tokens=False)
+        if len(encoded) != 1:
+            raise ValueError(
+                f"VideoMME option {letter!r} is not one token: {encoded}"
+            )
+        ids.append(encoded[0])
+    return torch.tensor(ids, dtype=torch.long)
+
+
+@torch.no_grad()
+def frozen_teacher_option_logits(
+    model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    answer: str,
+    full_visual_tokens: torch.Tensor,
+    option_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Return A/B/C/D logits from the frozen full-visual LLaVA teacher."""
+    embeds, labels, mask = build_inputs(
+        model, tokenizer, prompt_ids, answer, full_visual_tokens.detach()
+    )
+    outputs = model.model(
+        inputs_embeds=embeds,
+        attention_mask=mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    shifted_labels = labels[:, 1:].to(outputs.last_hidden_state.device)
+    answer_mask = shifted_labels.ne(-100)
+    answer_hidden = outputs.last_hidden_state[:, :-1][answer_mask]
+    if answer_hidden.shape[0] != 1:
+        raise RuntimeError(
+            "VideoMME teacher expects exactly one answer token, got "
+            f"{answer_hidden.shape[0]}"
+        )
+    logits = model.lm_head(answer_hidden)
+    return logits[:, option_ids.to(logits.device)].float().detach()
+
+
+def frozen_teacher_visual_importance(
+    model,
+    tokenizer,
+    prompt_ids: torch.Tensor,
+    answer: str,
+    full_visual_tokens: torch.Tensor,
+    topk: int,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute answer-conditioned Grad x Activation on native visual tokens.
+
+    LLaVA parameters remain frozen.  Only the detached visual-token leaf has
+    ``requires_grad=True``; the question and answer supervise the loss but are
+    never inputs to the ADBT memory-construction forward path.
+    """
+    teacher_visual = full_visual_tokens.detach().float().requires_grad_(True)
+    embeds, labels, mask = build_inputs(
+        model, tokenizer, prompt_ids, answer, teacher_visual
+    )
+    outputs = model.model(
+        inputs_embeds=embeds,
+        attention_mask=mask,
+        use_cache=False,
+        return_dict=True,
+    )
+    shifted_labels = labels[:, 1:].to(outputs.last_hidden_state.device)
+    answer_mask = shifted_labels.ne(-100)
+    answer_hidden = outputs.last_hidden_state[:, :-1][answer_mask]
+    answer_labels = shifted_labels[answer_mask]
+    if answer_hidden.shape[0] != 1:
+        raise RuntimeError(
+            "VideoMME routing teacher expects exactly one answer token, got "
+            f"{answer_hidden.shape[0]}"
+        )
+    answer_logits = model.lm_head(answer_hidden)
+    correct_logit = answer_logits.gather(1, answer_labels[:, None]).sum()
+    # The installed LLaVA stack uses reentrant gradient checkpointing, which
+    # is incompatible with torch.autograd.grad(inputs=...).  All model
+    # parameters are frozen, so a scalar backward populates only this visual
+    # leaf and is mathematically equivalent for Grad x Activation.
+    correct_logit.backward()
+    visual_gradients = teacher_visual.grad
+    if visual_gradients is None:
+        raise RuntimeError("full-visual teacher produced no visual gradient")
+    importance = gradient_activation_importance(
+        teacher_visual, visual_gradients, topk=topk
+    )
+    metrics = {
+        "teacher_correct_logit": float(correct_logit.detach().cpu()),
+        "teacher_visual_grad_norm": float(
+            visual_gradients.detach().float().norm().cpu()
+        ),
+        "teacher_importance_nonzero": float(
+            (importance > 0).float().sum(dim=-1).mean().cpu()
+        ),
+    }
+    return importance, metrics
+
+
+def resize_audio_frames(audio: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Chronologically resize cross-video audio along the frame axis."""
+    if audio.dim() != 3:
+        raise ValueError(f"audio must be [F,L,D], got {tuple(audio.shape)}")
+    if target_frames <= 0:
+        raise ValueError("target_frames must be positive")
+    if audio.shape[0] == target_frames:
+        return audio.clone()
+    indices = torch.linspace(0, audio.shape[0] - 1, target_frames).round().long()
+    return audio.index_select(0, indices)
+
+
+def counterfactual_audio(
+    real_audio: torch.Tensor,
+    mode: str,
+    previous_video_audio: torch.Tensor | None,
+    seed: int,
+) -> Tuple[torch.Tensor, str]:
+    """Construct a wrong-audio control without changing visual/time inputs."""
+    if mode == "cycle":
+        choices = ("shuffled", "stale", "crossvideo")
+        mode = choices[seed % len(choices)]
+    if mode == "crossvideo" and previous_video_audio is None:
+        mode = "shuffled"
+    if mode == "shuffled":
+        if real_audio.shape[0] <= 1:
+            return torch.zeros_like(real_audio), "zero_fallback"
+        generator = torch.Generator().manual_seed(seed)
+        permutation = torch.randperm(real_audio.shape[0], generator=generator)
+        return real_audio.index_select(0, permutation), mode
+    if mode == "stale":
+        if real_audio.shape[0] <= 1:
+            return torch.zeros_like(real_audio), "zero_fallback"
+        return torch.cat([torch.zeros_like(real_audio[:1]), real_audio[:-1]], 0), mode
+    if mode == "crossvideo":
+        return resize_audio_frames(previous_video_audio, real_audio.shape[0]), mode
+    if mode == "zero":
+        return torch.zeros_like(real_audio), mode
+    raise ValueError(f"Unsupported counterfactual audio mode: {mode}")
 
 
 def encode_visual(model, image_processor, frames: np.ndarray, batch_size: int):
@@ -451,6 +605,26 @@ def train(args):
         raise ValueError("--architecture phase4 requires --value-mode native")
     if args.attention_temperature <= 0:
         raise ValueError("--attention-temperature must be > 0")
+    if args.training_objective == "av_pretrain" and args.gradient_accumulation_steps != 1:
+        raise ValueError("AV pretraining currently requires gradient accumulation 1")
+    if args.av_temperature <= 0:
+        raise ValueError("--av-temperature must be > 0")
+    if args.av_loss_weight < 0 or args.cf_loss_weight < 0:
+        raise ValueError("Phase-5 loss weights must be non-negative")
+    if min(
+        args.route_loss_weight,
+        args.feature_loss_weight,
+        args.av_routing_loss_weight,
+    ) < 0:
+        raise ValueError("Phase-5.1 loss weights must be non-negative")
+    if args.av_routing_temperature <= 0:
+        raise ValueError("--av-routing-temperature must be positive")
+    if args.teacher_importance_topk < 0:
+        raise ValueError("--teacher-importance-topk must be non-negative")
+    if args.cf_margin < 0:
+        raise ValueError("--cf-margin must be non-negative")
+    if args.cf_kd_temperature <= 0:
+        raise ValueError("--cf-kd-temperature must be positive")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -641,6 +815,19 @@ def train(args):
         resume_video_idx = int(checkpoint.get("video_idx", 0))
         global_step = int(checkpoint.get("global_step", 0))
         LOGGER.info("resuming from epoch=%d video=%d step=%d", resume_epoch, resume_video_idx, global_step)
+    if args.training_objective == "av_pretrain":
+        for parameter in adbt.parameters():
+            parameter.requires_grad_(False)
+        for parameter in adbt.query_generator.audio_projection.parameters():
+            parameter.requires_grad_(True)
+        for parameter in adbt.visual_key.parameters():
+            parameter.requires_grad_(True)
+        LOGGER.info(
+            "Phase-5 Stage A: training only shared audio_projection and visual_key"
+        )
+    av_queue = AVFeatureQueue(args.av_queue_size)
+    previous_video_audio = None
+    video_option_token_ids = option_token_ids(tokenizer)
     next_eval_step = None
     if args.eval_every_steps > 0:
         next_eval_step = ((global_step // args.eval_every_steps) + 1) * args.eval_every_steps
@@ -666,15 +853,155 @@ def train(args):
             visual = encode_visual(model, image_processor, frames, args.vision_batch_size)
             audio = audio_encoder.encode_video(path, timestamps, visual.device, ablation="real")
             adbt.to(device=visual.device, dtype=torch.float32)
+            audio_embeddings = audio["embeddings"].to(
+                visual.device, dtype=torch.float32
+            )
+            audio_timestamps = audio["end_timestamps"].to(visual.device)
+            if args.training_objective == "av_pretrain":
+                optimizer.zero_grad(set_to_none=True)
+                av_result = temporal_av_contrastive_loss(
+                    adbt,
+                    audio_embeddings,
+                    visual.float(),
+                    audio_timestamps,
+                    temperature=args.av_temperature,
+                    min_temporal_offset=args.av_min_temporal_offset,
+                    queue=av_queue,
+                )
+                require_finite(
+                    av_result.loss,
+                    "av_loss",
+                    args,
+                    adbt,
+                    optimizer,
+                    epoch,
+                    current_video_index,
+                    global_step,
+                    current_video,
+                    tensors={"visual": visual, "audio_embeddings": audio_embeddings},
+                )
+                av_result.loss.backward()
+                clipped_grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in adbt.parameters() if p.requires_grad],
+                        args.max_grad_norm,
+                        error_if_nonfinite=True,
+                    )
+                )
+                optimizer.step()
+                global_step += 1
+                av_queue.enqueue(
+                    audio_embeddings.mean(dim=1), visual.detach().float().mean(dim=1)
+                )
+                if global_step == 1 or global_step % args.log_every == 0:
+                    LOGGER.info(
+                        "phase5_av epoch=%d video=%d/%d step=%d loss=%.5f "
+                        "r1=%.4f r5=%.4f temporal=%.4f queue=%d grad=%.5f",
+                        epoch + 1,
+                        current_video_index,
+                        total_train_videos,
+                        global_step,
+                        float(av_result.loss.detach().cpu()),
+                        av_result.metrics["recall_at_1"],
+                        av_result.metrics["recall_at_5"],
+                        av_result.metrics["temporal_hard_accuracy"],
+                        len(av_queue),
+                        clipped_grad_norm,
+                    )
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "train/step": global_step,
+                            "train/epoch": epoch + 1,
+                            "train/video_index": current_video_index,
+                            "train/grad_norm": clipped_grad_norm,
+                            "phase5/av_loss": float(av_result.loss.detach().cpu()),
+                            "phase5/av_recall_at_1": av_result.metrics["recall_at_1"],
+                            "phase5/av_recall_at_5": av_result.metrics["recall_at_5"],
+                            "phase5/av_temporal_hard_accuracy": av_result.metrics[
+                                "temporal_hard_accuracy"
+                            ],
+                            "phase5/av_queue_size": len(av_queue),
+                        },
+                        step=global_step,
+                    )
+                if (
+                    args.save_every_videos > 0
+                    and current_video_index % args.save_every_videos == 0
+                ):
+                    progress = (
+                        Path(args.output_dir)
+                        / f"adbt_epoch_{epoch + 1}_video_{current_video_index}.pt"
+                    )
+                    progress.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(
+                        {
+                            "audio_bottleneck": adbt.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "epoch": epoch,
+                            "video_idx": current_video_index,
+                            "global_step": global_step,
+                            "args": vars(args),
+                            "init_adapter": args.init_adapter,
+                            "split_file": args.split_file,
+                        },
+                        progress,
+                    )
+                    LOGGER.info("saved progress checkpoint %s", progress)
+                del av_result, audio_embeddings, audio_timestamps, visual, audio, frames, timestamps
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             # A video has three questions in VideoMME. Reuse its frozen
             # visual/audio features, but run each language loss separately so
             # the large frozen LLM activation graph is never accumulated three
             # times on the 80-GiB cards.
-            for row in rows:
+            for row_index, row in enumerate(rows):
+                prompt_ids = make_prompt(row, tokenizer)
+                teacher_importance = None
+                teacher_importance_metrics = {}
+                route_loss = visual.new_zeros((), dtype=torch.float32)
+                feature_loss = visual.new_zeros((), dtype=torch.float32)
+                av_routing_loss = visual.new_zeros((), dtype=torch.float32)
+                route_metrics = {}
+                feature_metrics = {}
+                av_routing_metrics = {}
+                teacher_feature_target = None
+                if args.training_objective == "phase5_1":
+                    # Run the full-visual teacher first and release its decoder
+                    # graph before the student graph is built.
+                    teacher_importance, teacher_importance_metrics = (
+                        frozen_teacher_visual_importance(
+                            model,
+                            tokenizer,
+                            prompt_ids,
+                            row["answer"],
+                            visual,
+                            topk=args.teacher_importance_topk,
+                        )
+                    )
+                    teacher_feature_target = teacher_visual_feature_targets(
+                        visual, args.num_queries
+                    )
+                av_loss = visual.new_zeros((), dtype=torch.float32)
+                av_metrics = {}
+                av_result = None
+                if args.training_objective == "phase5" and args.av_loss_weight > 0:
+                    av_result = temporal_av_contrastive_loss(
+                        adbt,
+                        audio_embeddings,
+                        visual.float(),
+                        audio_timestamps,
+                        temperature=args.av_temperature,
+                        min_temporal_offset=args.av_min_temporal_offset,
+                        queue=av_queue,
+                    )
+                    av_loss = av_result.loss
+                    av_metrics = av_result.metrics
                 latents, attention = adbt(
                     visual.float(),
-                    audio_embeddings=audio["embeddings"].to(visual.device, dtype=torch.float32),
-                    end_timestamps=audio["end_timestamps"].to(visual.device),
+                    audio_embeddings=audio_embeddings,
+                    end_timestamps=audio_timestamps,
                 )
                 latent_stats = tensor_stats(latents)
                 adbt_stats = dict(adbt.last_diagnostics)
@@ -712,15 +1039,85 @@ def train(args):
                     current_video,
                     tensors={"visual": visual, "audio_embeddings": audio["embeddings"]},
                 )
-                prompt_ids = make_prompt(row, tokenizer)
+                if args.training_objective == "phase5_1":
+                    route_loss, route_metrics = teacher_routing_alignment_loss(
+                        teacher_importance, attention
+                    )
+                    feature_loss, feature_metrics = (
+                        visual_feature_distillation_loss(
+                            latents, teacher_feature_target
+                        )
+                    )
+                    av_routing_loss, av_routing_metrics = (
+                        audio_visual_routing_contrastive_loss(
+                            adbt,
+                            audio_embeddings,
+                            latents,
+                            audio_timestamps,
+                            temperature=args.av_routing_temperature,
+                            min_temporal_offset=args.av_min_temporal_offset,
+                        )
+                    )
                 embeds, labels, mask = build_inputs(model, tokenizer, prompt_ids, row["answer"], latents)
+                teacher_option_logits = None
+                if (
+                    args.training_objective == "phase5"
+                    and args.cf_loss_weight > 0
+                    and args.cf_objective == "teacher_kd"
+                ):
+                    teacher_option_logits = frozen_teacher_option_logits(
+                        model,
+                        tokenizer,
+                        prompt_ids,
+                        row["answer"],
+                        visual,
+                        video_option_token_ids,
+                    )
+                wrong_latents = None
+                wrong_audio_embeddings = None
+                wrong_audio_cpu = None
+                wrong_embeds = None
+                wrong_labels = None
+                wrong_mask = None
+                option_logits = None
+                answer_index = None
+                negative_mode = "disabled"
+                if args.training_objective == "phase5" and args.cf_loss_weight > 0:
+                    wrong_audio_cpu, negative_mode = counterfactual_audio(
+                        audio["embeddings"],
+                        args.cf_negative,
+                        previous_video_audio,
+                        seed=args.seed + global_step + row_index,
+                    )
+                    wrong_audio_embeddings = wrong_audio_cpu.to(
+                        visual.device, dtype=torch.float32
+                    )
+                    wrong_latents, _ = adbt(
+                        visual.float(),
+                        audio_embeddings=wrong_audio_embeddings,
+                        end_timestamps=audio_timestamps,
+                    )
+                    wrong_embeds, wrong_labels, wrong_mask = build_inputs(
+                        model,
+                        tokenizer,
+                        prompt_ids,
+                        row["answer"],
+                        wrong_latents,
+                    )
+                    model_embeds = torch.cat([embeds, wrong_embeds], dim=0)
+                    model_labels = torch.cat([labels, wrong_labels], dim=0)
+                    model_mask = torch.cat([mask, wrong_mask], dim=0)
+                else:
+                    model_embeds = embeds
+                    model_labels = labels
+                    model_mask = mask
                 # Avoid full CausalLM logits [sequence, 152k] (which can cost
                 # >9 GiB in float32). Only the answer-token positions are
                 # supervised, so run the frozen backbone and project those
                 # final hidden states through lm_head.
                 backbone_outputs = model.model(
-                    inputs_embeds=embeds,
-                    attention_mask=mask,
+                    inputs_embeds=model_embeds,
+                    attention_mask=model_mask,
                     use_cache=False,
                     return_dict=True,
                 )
@@ -740,15 +1137,15 @@ def train(args):
                 # Causal LM alignment: the hidden state at position t predicts
                 # the token at t+1.  The answer label is therefore selected
                 # from labels[:, 1:] while its predictor is hidden[:, :-1].
-                shifted_labels = labels[:, 1:].to(hidden.device)
+                shifted_labels = model_labels[:, 1:].to(hidden.device)
                 shifted_hidden = hidden[:, :-1]
                 answer_mask = shifted_labels.ne(-100)
                 answer_hidden = shifted_hidden[answer_mask]
                 answer_labels = shifted_labels[answer_mask]
                 lm_head = model.lm_head
-                answer_logits = lm_head(answer_hidden)
+                all_answer_logits = lm_head(answer_hidden)
                 require_finite(
-                    answer_logits,
+                    all_answer_logits,
                     "answer_logits",
                     args,
                     adbt,
@@ -759,7 +1156,64 @@ def train(args):
                     current_video,
                     tensors={"latent": latents, "hidden": hidden},
                 )
-                raw_loss = F.cross_entropy(answer_logits.float(), answer_labels)
+                qa_loss = F.cross_entropy(
+                    all_answer_logits[:1].float(), answer_labels[:1]
+                )
+                cf_loss = qa_loss.new_zeros(())
+                cf_metrics = {
+                    "real_margin": float("nan"),
+                    "wrong_margin": float("nan"),
+                    "teacher_kl_real": float("nan"),
+                    "teacher_kl_wrong": float("nan"),
+                    "teacher_kl_advantage": float("nan"),
+                    "violation_rate": 0.0,
+                }
+                if wrong_latents is not None:
+                    if all_answer_logits.shape[0] != 2:
+                        raise RuntimeError(
+                            "Phase-5 counterfactual training expects one answer token "
+                            f"per branch, got {all_answer_logits.shape[0]}"
+                        )
+                    option_ids = video_option_token_ids.to(all_answer_logits.device)
+                    option_logits = all_answer_logits[:, option_ids].float()
+                    answer_index = torch.tensor(
+                        ["ABCD".index(str(row["answer"]).strip())],
+                        device=option_logits.device,
+                    )
+                    if args.cf_objective == "teacher_kd":
+                        if teacher_option_logits is None:
+                            raise RuntimeError("teacher logits were not constructed")
+                        kd_loss, kd_metrics = counterfactual_teacher_kd_loss(
+                            teacher_option_logits,
+                            option_logits[:1],
+                            option_logits[1:],
+                            margin=args.cf_margin,
+                            temperature=args.cf_kd_temperature,
+                        )
+                        cf_loss = kd_loss
+                        cf_metrics.update(kd_metrics)
+                    else:
+                        margin_loss, margin_metrics = counterfactual_qa_margin_loss(
+                            option_logits[:1],
+                            option_logits[1:],
+                            answer_index,
+                            margin=args.cf_margin,
+                        )
+                        cf_loss = margin_loss
+                        cf_metrics.update(margin_metrics)
+                if args.training_objective == "phase5_1":
+                    raw_loss = (
+                        qa_loss
+                        + args.route_loss_weight * route_loss
+                        + args.feature_loss_weight * feature_loss
+                        + args.av_routing_loss_weight * av_routing_loss
+                    )
+                else:
+                    raw_loss = (
+                        qa_loss
+                        + args.av_loss_weight * av_loss
+                        + args.cf_loss_weight * cf_loss
+                    )
                 loss = raw_loss / args.gradient_accumulation_steps
                 require_finite(
                     loss,
@@ -771,10 +1225,16 @@ def train(args):
                     current_video_index,
                     global_step,
                     current_video,
-                    tensors={"latent": latents, "answer_logits": answer_logits},
+                    tensors={"latent": latents, "answer_logits": all_answer_logits},
                 )
                 loss.backward()
                 raw_loss_value = float(raw_loss.detach().cpu())
+                qa_loss_value = float(qa_loss.detach().cpu())
+                av_loss_value = float(av_loss.detach().cpu())
+                cf_loss_value = float(cf_loss.detach().cpu())
+                route_loss_value = float(route_loss.detach().cpu())
+                feature_loss_value = float(feature_loss.detach().cpu())
+                av_routing_loss_value = float(av_routing_loss.detach().cpu())
                 video_loss_sum += raw_loss_value
                 video_loss_count += 1
                 if global_step == 0:
@@ -843,7 +1303,7 @@ def train(args):
                             global_step,
                             current_video,
                             reason="nonfinite_gradient_norm",
-                            tensors={"latent": latents, "answer_logits": answer_logits},
+                            tensors={"latent": latents, "answer_logits": all_answer_logits},
                         )
                         raise
                     optimizer.step()
@@ -896,11 +1356,158 @@ def train(args):
                         "adbt_qk/score_max": adbt_stats["score_max"],
                         "adbt_qk/score_std": adbt_stats["score_std"],
                     }
+                    if args.training_objective == "phase5":
+                        metrics.update(
+                            {
+                                "phase5/qa_loss": qa_loss_value,
+                                "phase5/av_loss": av_loss_value,
+                                "phase5/cf_loss": cf_loss_value,
+                                "phase5/cf_real_margin": cf_metrics["real_margin"],
+                                "phase5/cf_wrong_margin": cf_metrics["wrong_margin"],
+                                "phase5/cf_teacher_kl_real": cf_metrics[
+                                    "teacher_kl_real"
+                                ],
+                                "phase5/cf_teacher_kl_wrong": cf_metrics[
+                                    "teacher_kl_wrong"
+                                ],
+                                "phase5/cf_teacher_kl_advantage": cf_metrics[
+                                    "teacher_kl_advantage"
+                                ],
+                                "phase5/cf_violation_rate": cf_metrics[
+                                    "violation_rate"
+                                ],
+                                "phase5/negative_shuffled": float(
+                                    negative_mode == "shuffled"
+                                ),
+                                "phase5/negative_stale": float(
+                                    negative_mode == "stale"
+                                ),
+                                "phase5/negative_crossvideo": float(
+                                    negative_mode == "crossvideo"
+                                ),
+                            }
+                        )
+                        if av_metrics:
+                            metrics.update(
+                                {
+                                    "phase5/av_recall_at_1": av_metrics[
+                                        "recall_at_1"
+                                    ],
+                                    "phase5/av_recall_at_5": av_metrics[
+                                        "recall_at_5"
+                                    ],
+                                    "phase5/av_temporal_hard_accuracy": av_metrics[
+                                        "temporal_hard_accuracy"
+                                    ],
+                                    "phase5/av_queue_size": av_metrics["queue_size"],
+                                }
+                            )
+                    elif args.training_objective == "phase5_1":
+                        metrics.update(
+                            {
+                                "phase5_1/qa_loss": qa_loss_value,
+                                "phase5_1/route_loss": route_loss_value,
+                                "phase5_1/feature_loss": feature_loss_value,
+                                "phase5_1/av_routing_loss": av_routing_loss_value,
+                                "phase5_1/teacher_correct_logit": teacher_importance_metrics[
+                                    "teacher_correct_logit"
+                                ],
+                                "phase5_1/teacher_visual_grad_norm": teacher_importance_metrics[
+                                    "teacher_visual_grad_norm"
+                                ],
+                                "phase5_1/teacher_importance_nonzero": teacher_importance_metrics[
+                                    "teacher_importance_nonzero"
+                                ],
+                                "phase5_1/teacher_importance_peak": route_metrics[
+                                    "teacher_importance_peak"
+                                ],
+                                "phase5_1/student_mass_on_teacher_top1": route_metrics[
+                                    "student_mass_on_teacher_top1"
+                                ],
+                                "phase5_1/feature_cosine": feature_metrics[
+                                    "feature_cosine"
+                                ],
+                                "phase5_1/av_routing_recall_at_1": av_routing_metrics[
+                                    "recall_at_1"
+                                ],
+                                "phase5_1/av_routing_recall_at_5": av_routing_metrics[
+                                    "recall_at_5"
+                                ],
+                                "phase5_1/av_routing_temporal_hard_accuracy": av_routing_metrics[
+                                    "temporal_hard_accuracy"
+                                ],
+                                "phase5_1/av_routing_positive_similarity": av_routing_metrics[
+                                    "positive_similarity"
+                                ],
+                            }
+                        )
                     if clipped_grad_norm is not None:
                         metrics["train/grad_norm"] = clipped_grad_norm
                     metrics.update(rank_metrics)
                     metrics.update(module_metrics)
                     wandb_run.log(metrics, step=global_step)
+                if (
+                    args.training_objective == "phase5"
+                    and global_step % args.log_every == 0
+                ):
+                    if args.cf_objective == "teacher_kd":
+                        LOGGER.info(
+                            "phase5_kd step=%d qa=%.5f av=%.5f cf=%.5f "
+                            "kl_real=%.4f kl_wrong=%.4f advantage=%.4f "
+                            "violation=%.2f negative=%s av_r1=%.4f av_r5=%.4f "
+                            "temporal=%.4f",
+                            global_step,
+                            qa_loss_value,
+                            av_loss_value,
+                            cf_loss_value,
+                            cf_metrics["teacher_kl_real"],
+                            cf_metrics["teacher_kl_wrong"],
+                            cf_metrics["teacher_kl_advantage"],
+                            cf_metrics["violation_rate"],
+                            negative_mode,
+                            av_metrics.get("recall_at_1", float("nan")),
+                            av_metrics.get("recall_at_5", float("nan")),
+                            av_metrics.get("temporal_hard_accuracy", float("nan")),
+                        )
+                    else:
+                        LOGGER.info(
+                            "phase5 step=%d qa=%.5f av=%.5f cf=%.5f "
+                            "real_margin=%.4f wrong_margin=%.4f violation=%.2f "
+                            "negative=%s av_r1=%.4f av_r5=%.4f temporal=%.4f",
+                            global_step,
+                            qa_loss_value,
+                            av_loss_value,
+                            cf_loss_value,
+                            cf_metrics["real_margin"],
+                            cf_metrics["wrong_margin"],
+                            cf_metrics["violation_rate"],
+                            negative_mode,
+                            av_metrics.get("recall_at_1", float("nan")),
+                            av_metrics.get("recall_at_5", float("nan")),
+                            av_metrics.get("temporal_hard_accuracy", float("nan")),
+                        )
+                elif (
+                    args.training_objective == "phase5_1"
+                    and global_step % args.log_every == 0
+                ):
+                    LOGGER.info(
+                        "phase5.1 step=%d qa=%.5f route=%.5f feat=%.5f "
+                        "av_route=%.5f feat_cos=%.4f teacher_grad=%.5f "
+                        "teacher_topk=%.1f student_teacher_mass=%.5f "
+                        "av_r1=%.4f av_r5=%.4f temporal=%.4f",
+                        global_step,
+                        qa_loss_value,
+                        route_loss_value,
+                        feature_loss_value,
+                        av_routing_loss_value,
+                        feature_metrics["feature_cosine"],
+                        teacher_importance_metrics["teacher_visual_grad_norm"],
+                        teacher_importance_metrics["teacher_importance_nonzero"],
+                        route_metrics["student_mass_on_teacher_top1"],
+                        av_routing_metrics["recall_at_1"],
+                        av_routing_metrics["recall_at_5"],
+                        av_routing_metrics["temporal_hard_accuracy"],
+                    )
                 if rank_metrics or module_metrics:
                     LOGGER.info(
                         "phase4.1 step=%d P_rank=%.3f Z_rank=%.3f grad_audio/key=%.6f "
@@ -919,6 +1526,11 @@ def train(args):
                             {"train/step": global_step, **rank_metrics, **module_metrics},
                             step=global_step,
                         )
+            if args.training_objective == "phase5":
+                av_queue.enqueue(
+                    audio_embeddings.mean(dim=1), visual.detach().float().mean(dim=1)
+                )
+                previous_video_audio = audio["embeddings"].detach().float().cpu()
             if global_step % args.log_every == 0:
                 mean_video_loss = video_loss_sum / max(1, video_loss_count)
                 LOGGER.info(
@@ -966,9 +1578,32 @@ def train(args):
                     answer_mask,
                     answer_hidden,
                     answer_labels,
-                    answer_logits,
+                    all_answer_logits,
+                    qa_loss,
+                    av_loss,
+                    cf_loss,
+                    route_loss,
+                    feature_loss,
+                    av_routing_loss,
                     loss,
                     raw_loss,
+                    audio_embeddings,
+                    audio_timestamps,
+                    wrong_audio_cpu,
+                    wrong_audio_embeddings,
+                    wrong_latents,
+                    wrong_embeds,
+                    wrong_labels,
+                    wrong_mask,
+                    model_embeds,
+                    model_labels,
+                    model_mask,
+                    av_result,
+                    option_logits,
+                    answer_index,
+                    teacher_option_logits,
+                    teacher_importance,
+                    teacher_feature_target,
                 )
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -1013,7 +1648,10 @@ def train(args):
                 while next_eval_step <= global_step:
                     next_eval_step += args.eval_every_steps
             overall_video_idx = video_offset + video_idx + 1
-            if overall_video_idx % args.save_every_videos == 0:
+            if (
+                args.save_every_videos > 0
+                and overall_video_idx % args.save_every_videos == 0
+            ):
                 progress = Path(args.output_dir) / f"adbt_epoch_{epoch + 1}_video_{overall_video_idx}.pt"
                 progress.parent.mkdir(parents=True, exist_ok=True)
                 torch.save({
@@ -1039,6 +1677,14 @@ def train(args):
             "split_file": args.split_file,
         }, out)
         LOGGER.info("saved %s", out)
+    if torch.cuda.is_available():
+        for device_index in range(torch.cuda.device_count()):
+            LOGGER.info(
+                "CUDA peak allocated cuda:%d=%.1f MiB peak reserved=%.1f MiB",
+                device_index,
+                torch.cuda.max_memory_allocated(device_index) / (1024 ** 2),
+                torch.cuda.max_memory_reserved(device_index) / (1024 ** 2),
+            )
     if wandb_run is not None:
         wandb_run.summary["final_global_step"] = global_step
         wandb_run.summary["completed_epochs"] = args.epochs
@@ -1087,6 +1733,43 @@ def parse_args():
             "Normalization applied to projected-value latents. Defaults to rmsnorm "
             "for projected mode and none for native mode; native requires none."
         ),
+    )
+    parser.add_argument(
+        "--training-objective",
+        choices=("phase4", "av_pretrain", "phase5", "phase5_1"),
+        default="phase4",
+        help=(
+            "phase4 keeps pure QA training; av_pretrain runs Phase-5 Stage A "
+            "alignment only; phase5 runs QA + AV + counterfactual loss; "
+            "phase5_1 runs QA + teacher routing + feature + AV-routing."
+        ),
+    )
+    parser.add_argument("--av-loss-weight", type=float, default=0.02)
+    parser.add_argument("--av-temperature", type=float, default=0.07)
+    parser.add_argument("--av-min-temporal-offset", type=float, default=5.0)
+    parser.add_argument("--av-queue-size", type=int, default=256)
+    parser.add_argument("--cf-loss-weight", type=float, default=0.2)
+    parser.add_argument("--cf-margin", type=float, default=0.2)
+    parser.add_argument(
+        "--cf-objective",
+        choices=("qa_margin", "teacher_kd"),
+        default="qa_margin",
+        help=(
+            "qa_margin ranks correct-answer margins; teacher_kd ranks KL "
+            "distance to an online frozen full-visual LLaVA teacher."
+        ),
+    )
+    parser.add_argument("--cf-kd-temperature", type=float, default=1.0)
+    parser.add_argument("--route-loss-weight", type=float, default=0.1)
+    parser.add_argument("--feature-loss-weight", type=float, default=0.05)
+    parser.add_argument("--av-routing-loss-weight", type=float, default=0.05)
+    parser.add_argument("--teacher-importance-topk", type=int, default=64)
+    parser.add_argument("--av-routing-temperature", type=float, default=0.07)
+    parser.add_argument(
+        "--cf-negative",
+        choices=("cycle", "shuffled", "stale", "crossvideo", "zero"),
+        default="cycle",
+        help="Wrong-audio source for Phase-5 counterfactual QA-margin training.",
     )
     parser.add_argument("--vision-batch-size", type=int, default=16)
     parser.add_argument("--beats-batch-size", type=int, default=8)
