@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 4 || $# -gt 6 ]]; then
-  echo "usage: $0 PHYSICAL_GPU AUDIO_MODE CHECKPOINT OUTPUT_DIR [ATTENTION_TEMPERATURE] [TASK]" >&2
+if [[ $# -lt 4 || $# -gt 7 ]]; then
+  echo "usage: $0 PHYSICAL_GPU AUDIO_MODE CHECKPOINT OUTPUT_DIR [ATTENTION_TEMPERATURE] [TASK] [BOTTLENECK_STAGE]" >&2
   exit 2
 fi
 
@@ -12,6 +12,7 @@ ADBT_CHECKPOINT="$3"
 OUTPUT_DIR="$4"
 ATTENTION_TEMPERATURE="${5:-0.05}"
 TASK="${6:-videomme_short}"
+BOTTLENECK_STAGE="${7:-3}"
 
 source /home/yxd/miniconda3/etc/profile.d/conda.sh
 conda activate streamingtom
@@ -30,7 +31,7 @@ export STREAMINGTOM_MEASURE_MEMORY=1
 export WRAPPER=streamingtom
 export VIDEOMME_SPLIT_FILE=./results/adbt_videomme_split.json
 export VIDEOMME_EVAL_SPLIT=test
-export AUDIO_BOTTLENECK_STAGE=3
+export AUDIO_BOTTLENECK_STAGE="${BOTTLENECK_STAGE}"
 export AUDIO_BOTTLENECK_NUM_QUERIES=64
 export AUDIO_BOTTLENECK_HIDDEN_SIZE=256
 export AUDIO_BOTTLENECK_NUM_HEADS=8

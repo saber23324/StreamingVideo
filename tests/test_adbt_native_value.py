@@ -22,6 +22,34 @@ def make_native(num_queries: int = 8) -> AudioConditionedBottleneck:
 
 
 class NativeValueADBTTest(unittest.TestCase):
+    def test_stage1_is_a_true_audio_free_static_query_control(self):
+        torch.manual_seed(5)
+        model = AudioConditionedBottleneck(
+            visual_dim=32,
+            num_queries=8,
+            hidden_size=16,
+            num_heads=4,
+            audio_dim=12,
+            stage=1,
+            latent_norm="none",
+            value_mode="native",
+        )
+        visual = torch.randn(2, 11, 32)
+        timestamps = torch.tensor([1.0, 3.0])
+
+        output_without_audio, attention_without_audio = model(
+            visual, None, timestamps
+        )
+        output_with_audio, attention_with_audio = model(
+            visual, torch.randn(2, 7, 12), timestamps
+        )
+
+        torch.testing.assert_close(output_without_audio, output_with_audio)
+        torch.testing.assert_close(attention_without_audio, attention_with_audio)
+        output_without_audio.square().mean().backward()
+        self.assertIsNone(model.query_generator.audio_projection.weight.grad)
+        self.assertIsNotNone(model.query_generator.query_tokens.grad)
+
     def test_effective_rank_distinguishes_full_rank_rank_one_and_zero(self):
         identity = torch.eye(8).unsqueeze(0)
         rank_one = torch.ones(1, 8, 13)

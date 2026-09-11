@@ -222,7 +222,7 @@ def init_wandb(args, split, train_rows):
     config = vars(args).copy()
     config.update(
         {
-            "dataset": "lmms-lab/Video-MME",
+            "dataset": args.dataset_name,
             "train_rows": len(train_rows),
             "train_videos": len(split["train"]),
             "test_videos": len(split["test"]),
@@ -270,17 +270,86 @@ def make_split(dataset, split_file: Path, seed: int = 1234, train_fraction: floa
     return split
 
 
-def sample_video(video_path: str, fps="auto", max_frames: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+def sample_video(
+    video_path: str,
+    fps="auto",
+    max_frames: int = 0,
+    end_time_seconds: float | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     reader = VideoReader(video_path, ctx=cpu(0))
     total = len(reader)
     source_fps = float(reader.get_avg_fps())
-    duration = total / source_fps
-    actual_fps = (0.2 if duration > 1800 else 0.5) if fps == "auto" else float(fps)
+    full_duration = total / source_fps
+    duration = full_duration
+    if end_time_seconds is not None:
+        if end_time_seconds <= 0:
+            raise ValueError(f"end_time_seconds must be positive, got {end_time_seconds}")
+        duration = min(full_duration, float(end_time_seconds))
+    if isinstance(fps, str) and fps.startswith("auto"):
+        scale_text = fps[len("auto") :]
+        scale = float(scale_text) if scale_text else 1.0
+        if scale <= 0:
+            raise ValueError(f"FPS scale must be positive, got {fps}")
+        actual_fps = (0.2 if duration > 1800 else 0.5) * scale
+    else:
+        actual_fps = float(fps)
     target = max(1, min(total, math.ceil(duration * actual_fps)))
     if max_frames > 0:
         target = min(target, max_frames)
-    indices = np.linspace(0, total - 1, target, dtype=int)
+    last_index = min(total - 1, max(0, math.floor(duration * source_fps) - 1))
+    indices = np.linspace(0, last_index, target, dtype=int)
     return reader.get_batch(indices).asnumpy(), indices.astype(np.float32) / source_fps
+
+
+def sample_video_for_rows(
+    video_path: str,
+    rows: List[Dict],
+    fps="auto",
+    max_frames: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+    """Decode the union of exact per-question causal sampling grids.
+
+    Each returned position array indexes the union and therefore reconstructs
+    exactly the frames that would be sampled for that row alone. This lets the
+    frozen vision/audio frontends run once per video without giving an early
+    question frames from a later timestamp.
+    """
+    reader = VideoReader(video_path, ctx=cpu(0))
+    total = len(reader)
+    source_fps = float(reader.get_avg_fps())
+    full_duration = total / source_fps
+    grids = []
+    for row in rows:
+        query_time = row.get("query_time_seconds")
+        duration = (
+            full_duration
+            if query_time is None
+            else min(full_duration, float(query_time))
+        )
+        if duration <= 0:
+            raise ValueError(f"non-positive sampling duration for row {row}")
+        if isinstance(fps, str) and fps.startswith("auto"):
+            scale_text = fps[len("auto") :]
+            scale = float(scale_text) if scale_text else 1.0
+            if scale <= 0:
+                raise ValueError(f"FPS scale must be positive, got {fps}")
+            actual_fps = (0.2 if duration > 1800 else 0.5) * scale
+        else:
+            actual_fps = float(fps)
+        target = max(1, min(total, math.ceil(duration * actual_fps)))
+        if max_frames > 0:
+            target = min(target, max_frames)
+        last_index = min(total - 1, max(0, math.floor(duration * source_fps) - 1))
+        grids.append(np.linspace(0, last_index, target, dtype=np.int64))
+
+    union = np.unique(np.concatenate(grids))
+    lookup = {int(frame_index): position for position, frame_index in enumerate(union)}
+    row_positions = [
+        np.asarray([lookup[int(frame_index)] for frame_index in grid], dtype=np.int64)
+        for grid in grids
+    ]
+    frames = reader.get_batch(union).asnumpy()
+    return frames, union.astype(np.float32) / source_fps, row_positions
 
 
 def video_path(video_id: str) -> str:
@@ -290,6 +359,36 @@ def video_path(video_id: str) -> str:
         if candidate.exists():
             return str(candidate)
     raise FileNotFoundError(f"VideoMME video not found for {video_id} below {root}")
+
+
+def row_video_path(row: Dict) -> str:
+    """Resolve media from a normalized manifest or the legacy VideoMME cache."""
+    explicit = row.get("video_path")
+    if explicit:
+        path = Path(str(explicit))
+        if not path.is_file():
+            raise FileNotFoundError(f"manifest video does not exist: {path}")
+        return str(path)
+    return video_path(str(row["videoID"]))
+
+
+def rows_end_time(rows: List[Dict]) -> float | None:
+    """Return the latest causal query boundary, or None for whole-video QA."""
+    values = [
+        float(row["query_time_seconds"])
+        for row in rows
+        if row.get("query_time_seconds") is not None
+    ]
+    return max(values) if values else None
+
+
+def causal_prefix_length(timestamps, row: Dict) -> int:
+    """Number of sampled frames available when this row's question arrives."""
+    query_time = row.get("query_time_seconds")
+    if query_time is None:
+        return len(timestamps)
+    values = np.asarray(timestamps, dtype=np.float64)
+    return max(1, int(np.searchsorted(values, float(query_time) + 1e-6, side="right")))
 
 
 def make_prompt(doc: Dict, tokenizer) -> torch.Tensor:
@@ -549,20 +648,44 @@ def evaluate_small_set(
                 rows = rows_by_video.get(video_id, [])
                 if not rows:
                     continue
-                path = video_path(video_id)
-                frames, timestamps = sample_video(path, max_frames=max_frames)
+                path = row_video_path(rows[0])
+                frames, timestamps, row_frame_positions = sample_video_for_rows(
+                    path, rows, max_frames=max_frames
+                )
                 visual = encode_visual(model, image_processor, frames, vision_batch_size)
-                audio = audio_encoder.encode_video(path, timestamps, visual.device, ablation="real")
+                audio = None
+                audio_embeddings = None
+                audio_timestamps = torch.as_tensor(
+                    timestamps, device=visual.device, dtype=torch.float32
+                )
+                if adbt.stage >= 2:
+                    audio = audio_encoder.encode_video(
+                        path, timestamps, visual.device, ablation="real"
+                    )
+                    audio_embeddings = audio["embeddings"].to(
+                        visual.device, dtype=torch.float32
+                    )
+                    audio_timestamps = audio["end_timestamps"].to(visual.device)
                 adbt.to(device=visual.device, dtype=torch.float32)
                 latents, _ = adbt(
                     visual.float(),
-                    audio_embeddings=audio["embeddings"].to(visual.device, dtype=torch.float32),
-                    end_timestamps=audio["end_timestamps"].to(visual.device),
+                    audio_embeddings=audio_embeddings,
+                    end_timestamps=audio_timestamps,
                 )
                 frames_seen += int(frames.shape[0])
-                for row in rows:
+                for row_index, row in enumerate(rows):
                     prompt_ids = make_prompt(row, tokenizer)
-                    embeds, labels, mask = build_inputs(model, tokenizer, prompt_ids, row["answer"], latents)
+                    positions = torch.as_tensor(
+                        row_frame_positions[row_index], device=latents.device
+                    )
+                    row_latents = latents.index_select(0, positions)
+                    embeds, labels, mask = build_inputs(
+                        model,
+                        tokenizer,
+                        prompt_ids,
+                        row["answer"],
+                        row_latents,
+                    )
                     outputs = model.model(
                         inputs_embeds=embeds,
                         attention_mask=mask,
@@ -581,7 +704,7 @@ def evaluate_small_set(
                         first_token_correct += int(prediction[0].item() == answer_labels[0].item())
                     exact_match_correct += int(torch.equal(prediction, answer_labels))
                     examples += 1
-                del latents, audio, visual, frames, timestamps
+                del latents, audio, audio_embeddings, audio_timestamps, visual, frames, timestamps, row_frame_positions
     finally:
         model.train(model_training)
         model.model.train(model_inner_training)
@@ -605,6 +728,12 @@ def train(args):
         raise ValueError("--architecture phase4 requires --value-mode native")
     if args.attention_temperature <= 0:
         raise ValueError("--attention-temperature must be > 0")
+    if args.bottleneck_stage not in (1, 2, 3):
+        raise ValueError("--bottleneck-stage must be 1, 2, or 3")
+    if args.bottleneck_stage < 3 and args.training_objective != "phase4":
+        raise ValueError(
+            "Vision-only Stage 1/2 controls support only the pure-QA phase4 objective"
+        )
     if args.training_objective == "av_pretrain" and args.gradient_accumulation_steps != 1:
         raise ValueError("AV pretraining currently requires gradient accumulation 1")
     if args.av_temperature <= 0:
@@ -612,11 +741,22 @@ def train(args):
     if args.av_loss_weight < 0 or args.cf_loss_weight < 0:
         raise ValueError("Phase-5 loss weights must be non-negative")
     if min(
+        args.qa_loss_weight,
         args.route_loss_weight,
         args.feature_loss_weight,
         args.av_routing_loss_weight,
     ) < 0:
         raise ValueError("Phase-5.1 loss weights must be non-negative")
+    if args.training_objective == "phase5_1" and not any(
+        weight > 0
+        for weight in (
+            args.qa_loss_weight,
+            args.route_loss_weight,
+            args.feature_loss_weight,
+            args.av_routing_loss_weight,
+        )
+    ):
+        raise ValueError("phase5_1 requires at least one non-zero loss weight")
     if args.av_routing_temperature <= 0:
         raise ValueError("--av-routing-temperature must be positive")
     if args.teacher_importance_topk < 0:
@@ -629,17 +769,35 @@ def train(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    dataset = load_dataset(
-        "lmms-lab/Video-MME",
-        cache_dir=args.hf_cache,
-        download_mode="reuse_dataset_if_exists",
-    )["test"]
+    if args.dataset_manifest:
+        manifest = json.loads(Path(args.dataset_manifest).read_text(encoding="utf-8"))
+        dataset = manifest["rows"]
+        args.dataset_name = str(manifest.get("dataset_name", Path(args.dataset_manifest).stem))
+        if args.training_objective != "phase4":
+            raise ValueError(
+                "normalized external manifests currently support the pure-QA "
+                "phase4 objective only"
+            )
+    else:
+        dataset = load_dataset(
+            "lmms-lab/Video-MME",
+            cache_dir=args.hf_cache,
+            download_mode="reuse_dataset_if_exists",
+        )["test"]
+        args.dataset_name = "lmms-lab/Video-MME"
     split = make_split(dataset, Path(args.split_file), args.seed, 0.8)
     train_ids = set(split["train"])
     train_rows = [row for row in dataset if str(row["videoID"]) in train_ids]
     if args.max_train_samples:
         train_rows = train_rows[: args.max_train_samples]
-    LOGGER.info("VideoMME rows: %d; train rows: %d; train videos: %d; test videos: %d", len(dataset), len(train_rows), len(split["train"]), len(split["test"]))
+    LOGGER.info(
+        "%s rows: %d; train rows: %d; train videos: %d; test videos: %d",
+        args.dataset_name,
+        len(dataset),
+        len(train_rows),
+        len(split["train"]),
+        len(split["test"]),
+    )
     wandb_run = init_wandb(args, split, train_rows)
 
     model_name = get_model_name_from_path(args.pretrained)
@@ -665,17 +823,24 @@ def train(args):
         num_queries=args.num_queries,
         hidden_size=args.bottleneck_hidden,
         num_heads=args.num_heads,
-        stage=3,
+        stage=args.bottleneck_stage,
         latent_norm=args.latent_norm,
         value_mode=args.value_mode,
         architecture=args.architecture,
         attention_temperature=args.attention_temperature,
     ).to(next(model.get_vision_tower().parameters()).device, dtype=torch.float32)
-    audio_encoder = BEATsAudioEncoder(
-        args.beats_checkpoint,
-        batch_size=args.beats_batch_size,
-        output_mode="temporal" if args.architecture == "phase4" else "mean",
-    )
+    audio_encoder = None
+    if args.bottleneck_stage >= 2:
+        audio_encoder = BEATsAudioEncoder(
+            args.beats_checkpoint,
+            batch_size=args.beats_batch_size,
+            output_mode="temporal" if args.architecture == "phase4" else "mean",
+        )
+    else:
+        LOGGER.info(
+            "Vision-only Stage 1: BEATs is disabled and static learnable queries "
+            "construct the visual bottleneck"
+        )
     optimizer = torch.optim.AdamW(adbt.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     if args.init_adapter:
@@ -836,10 +1001,23 @@ def train(args):
     rows_by_video = {}
     for row in train_rows:
         rows_by_video.setdefault(str(row["videoID"]), []).append(row)
-    total_train_videos = len(rows_by_video)
+    skipped_videos = {str(value) for value in args.skip_video}
+    unknown_skips = skipped_videos - set(rows_by_video)
+    if unknown_skips:
+        LOGGER.warning("requested skip videos are not in the train split: %s", sorted(unknown_skips))
+    effective_skips = skipped_videos & set(rows_by_video)
+    if effective_skips:
+        LOGGER.warning(
+            "explicitly skipping %d undecodable train videos (%d rows): %s",
+            len(effective_skips),
+            sum(len(rows_by_video[value]) for value in effective_skips),
+            sorted(effective_skips),
+        )
+    total_train_videos = len(rows_by_video) - len(effective_skips)
     for epoch in range(resume_epoch, args.epochs):
         video_order = list(rows_by_video)
         random.Random(args.seed + epoch).shuffle(video_order)
+        video_order = [value for value in video_order if value not in effective_skips]
         if epoch == resume_epoch and resume_video_idx:
             video_order = video_order[resume_video_idx:]
         video_offset = resume_video_idx if epoch == resume_epoch else 0
@@ -848,15 +1026,25 @@ def train(args):
             current_video_index = video_offset + video_idx + 1
             video_loss_sum = 0.0
             video_loss_count = 0
-            path = video_path(current_video)
-            frames, timestamps = sample_video(path, max_frames=args.train_max_frames)
-            visual = encode_visual(model, image_processor, frames, args.vision_batch_size)
-            audio = audio_encoder.encode_video(path, timestamps, visual.device, ablation="real")
-            adbt.to(device=visual.device, dtype=torch.float32)
-            audio_embeddings = audio["embeddings"].to(
-                visual.device, dtype=torch.float32
+            path = row_video_path(rows[0])
+            frames, timestamps, row_frame_positions = sample_video_for_rows(
+                path, rows, max_frames=args.train_max_frames
             )
-            audio_timestamps = audio["end_timestamps"].to(visual.device)
+            visual = encode_visual(model, image_processor, frames, args.vision_batch_size)
+            audio = None
+            audio_embeddings = None
+            audio_timestamps = torch.as_tensor(
+                timestamps, device=visual.device, dtype=torch.float32
+            )
+            if args.bottleneck_stage >= 2:
+                audio = audio_encoder.encode_video(
+                    path, timestamps, visual.device, ablation="real"
+                )
+                audio_embeddings = audio["embeddings"].to(
+                    visual.device, dtype=torch.float32
+                )
+                audio_timestamps = audio["end_timestamps"].to(visual.device)
+            adbt.to(device=visual.device, dtype=torch.float32)
             if args.training_objective == "av_pretrain":
                 optimizer.zero_grad(set_to_none=True)
                 av_result = temporal_av_contrastive_loss(
@@ -967,7 +1155,19 @@ def train(args):
                 feature_metrics = {}
                 av_routing_metrics = {}
                 teacher_feature_target = None
-                if args.training_objective == "phase5_1":
+                use_route_distillation = (
+                    args.training_objective == "phase5_1"
+                    and args.route_loss_weight > 0
+                )
+                use_feature_distillation = (
+                    args.training_objective == "phase5_1"
+                    and args.feature_loss_weight > 0
+                )
+                use_av_routing = (
+                    args.training_objective == "phase5_1"
+                    and args.av_routing_loss_weight > 0
+                )
+                if use_route_distillation:
                     # Run the full-visual teacher first and release its decoder
                     # graph before the student graph is built.
                     teacher_importance, teacher_importance_metrics = (
@@ -980,6 +1180,7 @@ def train(args):
                             topk=args.teacher_importance_topk,
                         )
                     )
+                if use_feature_distillation:
                     teacher_feature_target = teacher_visual_feature_targets(
                         visual, args.num_queries
                     )
@@ -1003,6 +1204,11 @@ def train(args):
                     audio_embeddings=audio_embeddings,
                     end_timestamps=audio_timestamps,
                 )
+                positions = torch.as_tensor(
+                    row_frame_positions[row_index], device=latents.device
+                )
+                latents = latents.index_select(0, positions)
+                attention = attention.index_select(0, positions)
                 latent_stats = tensor_stats(latents)
                 adbt_stats = dict(adbt.last_diagnostics)
                 attention_collapsed = (
@@ -1037,17 +1243,26 @@ def train(args):
                     current_video_index,
                     global_step,
                     current_video,
-                    tensors={"visual": visual, "audio_embeddings": audio["embeddings"]},
+                    tensors={
+                        "visual": visual,
+                        **(
+                            {"audio_embeddings": audio_embeddings}
+                            if audio_embeddings is not None
+                            else {}
+                        ),
+                    },
                 )
-                if args.training_objective == "phase5_1":
+                if use_route_distillation:
                     route_loss, route_metrics = teacher_routing_alignment_loss(
                         teacher_importance, attention
                     )
+                if use_feature_distillation:
                     feature_loss, feature_metrics = (
                         visual_feature_distillation_loss(
                             latents, teacher_feature_target
                         )
                     )
+                if use_av_routing:
                     av_routing_loss, av_routing_metrics = (
                         audio_visual_routing_contrastive_loss(
                             adbt,
@@ -1203,7 +1418,7 @@ def train(args):
                         cf_metrics.update(margin_metrics)
                 if args.training_objective == "phase5_1":
                     raw_loss = (
-                        qa_loss
+                        args.qa_loss_weight * qa_loss
                         + args.route_loss_weight * route_loss
                         + args.feature_loss_weight * feature_loss
                         + args.av_routing_loss_weight * av_routing_loss
@@ -1409,36 +1624,16 @@ def train(args):
                                 "phase5_1/route_loss": route_loss_value,
                                 "phase5_1/feature_loss": feature_loss_value,
                                 "phase5_1/av_routing_loss": av_routing_loss_value,
-                                "phase5_1/teacher_correct_logit": teacher_importance_metrics[
-                                    "teacher_correct_logit"
-                                ],
-                                "phase5_1/teacher_visual_grad_norm": teacher_importance_metrics[
-                                    "teacher_visual_grad_norm"
-                                ],
-                                "phase5_1/teacher_importance_nonzero": teacher_importance_metrics[
-                                    "teacher_importance_nonzero"
-                                ],
-                                "phase5_1/teacher_importance_peak": route_metrics[
-                                    "teacher_importance_peak"
-                                ],
-                                "phase5_1/student_mass_on_teacher_top1": route_metrics[
-                                    "student_mass_on_teacher_top1"
-                                ],
-                                "phase5_1/feature_cosine": feature_metrics[
-                                    "feature_cosine"
-                                ],
-                                "phase5_1/av_routing_recall_at_1": av_routing_metrics[
-                                    "recall_at_1"
-                                ],
-                                "phase5_1/av_routing_recall_at_5": av_routing_metrics[
-                                    "recall_at_5"
-                                ],
-                                "phase5_1/av_routing_temporal_hard_accuracy": av_routing_metrics[
-                                    "temporal_hard_accuracy"
-                                ],
-                                "phase5_1/av_routing_positive_similarity": av_routing_metrics[
-                                    "positive_similarity"
-                                ],
+                                "phase5_1/teacher_correct_logit": teacher_importance_metrics.get("teacher_correct_logit", float("nan")),
+                                "phase5_1/teacher_visual_grad_norm": teacher_importance_metrics.get("teacher_visual_grad_norm", float("nan")),
+                                "phase5_1/teacher_importance_nonzero": teacher_importance_metrics.get("teacher_importance_nonzero", float("nan")),
+                                "phase5_1/teacher_importance_peak": route_metrics.get("teacher_importance_peak", float("nan")),
+                                "phase5_1/student_mass_on_teacher_top1": route_metrics.get("student_mass_on_teacher_top1", float("nan")),
+                                "phase5_1/feature_cosine": feature_metrics.get("feature_cosine", float("nan")),
+                                "phase5_1/av_routing_recall_at_1": av_routing_metrics.get("recall_at_1", float("nan")),
+                                "phase5_1/av_routing_recall_at_5": av_routing_metrics.get("recall_at_5", float("nan")),
+                                "phase5_1/av_routing_temporal_hard_accuracy": av_routing_metrics.get("temporal_hard_accuracy", float("nan")),
+                                "phase5_1/av_routing_positive_similarity": av_routing_metrics.get("positive_similarity", float("nan")),
                             }
                         )
                     if clipped_grad_norm is not None:
@@ -1500,13 +1695,13 @@ def train(args):
                         route_loss_value,
                         feature_loss_value,
                         av_routing_loss_value,
-                        feature_metrics["feature_cosine"],
-                        teacher_importance_metrics["teacher_visual_grad_norm"],
-                        teacher_importance_metrics["teacher_importance_nonzero"],
-                        route_metrics["student_mass_on_teacher_top1"],
-                        av_routing_metrics["recall_at_1"],
-                        av_routing_metrics["recall_at_5"],
-                        av_routing_metrics["temporal_hard_accuracy"],
+                        feature_metrics.get("feature_cosine", float("nan")),
+                        teacher_importance_metrics.get("teacher_visual_grad_norm", float("nan")),
+                        teacher_importance_metrics.get("teacher_importance_nonzero", float("nan")),
+                        route_metrics.get("student_mass_on_teacher_top1", float("nan")),
+                        av_routing_metrics.get("recall_at_1", float("nan")),
+                        av_routing_metrics.get("recall_at_5", float("nan")),
+                        av_routing_metrics.get("temporal_hard_accuracy", float("nan")),
                     )
                 if rank_metrics or module_metrics:
                     LOGGER.info(
@@ -1696,14 +1891,42 @@ def parse_args():
     parser.add_argument("--pretrained", default="lmms-lab/llava-onevision-qwen2-7b-ov")
     parser.add_argument("--hf-cache", default="/home/yxd/.cache/huggingface")
     parser.add_argument("--beats-checkpoint", default="/nvme_data/pkt/huggingface/modules/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt1.pt")
+    parser.add_argument(
+        "--dataset-manifest",
+        default="",
+        help=(
+            "Optional normalized local MCQA manifest. Rows must contain "
+            "videoID, video_path, question, options, answer, and optionally "
+            "query_time_seconds. Without it the original VideoMME loader is used."
+        ),
+    )
     parser.add_argument("--split-file", default="./results/adbt_videomme_split.json")
     parser.add_argument("--output-dir", default="./results/adbt-checkpoints")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--train-max-frames", type=int, default=32)
+    parser.add_argument(
+        "--skip-video",
+        action="append",
+        default=[],
+        help=(
+            "Explicit train-split videoID to skip after a documented media-decode "
+            "failure. May be repeated; the held-out split is never altered."
+        ),
+    )
     parser.add_argument("--num-queries", type=int, default=32)
     parser.add_argument("--bottleneck-hidden", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument(
+        "--bottleneck-stage",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help=(
+            "ADBT stage. Stage 1 is the vision-only static-query control and "
+            "does not instantiate or run BEATs; Stage 3 is audio-conditioned."
+        ),
+    )
     parser.add_argument(
         "--architecture",
         choices=("legacy", "phase4"),
@@ -1760,6 +1983,16 @@ def parse_args():
         ),
     )
     parser.add_argument("--cf-kd-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--qa-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight of the supervised VideoMME QA loss in phase5_1. "
+            "Set to zero only for the literal objective-only ablations in "
+            "docs/experience.md; the historical Phase-5.1 default remains 1."
+        ),
+    )
     parser.add_argument("--route-loss-weight", type=float, default=0.1)
     parser.add_argument("--feature-loss-weight", type=float, default=0.05)
     parser.add_argument("--av-routing-loss-weight", type=float, default=0.05)

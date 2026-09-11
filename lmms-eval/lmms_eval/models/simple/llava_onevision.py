@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import math
+import os
 import re
 import warnings
 from datetime import timedelta
@@ -398,14 +399,18 @@ class Llava_OneVision(lmms):
             video_fps = vr.get_avg_fps()  # Get original video FPS
             video_duration = total_frame_num / video_fps  # Video duration in seconds
             
-            # Auto FPS selection based on video duration
-            if self.fps == "auto":
-                if video_duration > 1800:
-                    actual_fps = 0.2
-                else:
-                    actual_fps = 0.5
+            # Auto FPS selection based on video duration. ``auto2`` and
+            # ``auto3`` are explicit experiment settings that scale both sides
+            # of the official 30-minute boundary without changing that boundary.
+            if isinstance(self.fps, str) and self.fps.startswith("auto"):
+                scale_text = self.fps[len("auto") :]
+                fps_scale = float(scale_text) if scale_text else 1.0
+                if fps_scale <= 0:
+                    raise ValueError(f"FPS scale must be positive, got {self.fps}")
+                base_fps = 0.2 if video_duration > 1800 else 0.5
+                actual_fps = base_fps * fps_scale
             else:
-                actual_fps = self.fps
+                actual_fps = float(self.fps)
             
             # Calculate target number of frames based on desired FPS
             target_frames = math.ceil(video_duration * actual_fps)
@@ -419,6 +424,22 @@ class Llava_OneVision(lmms):
             uniform_sampled_frames = np.linspace(0, total_frame_num - 1, num_samples, dtype=int)  # StreamingTOM
         
         frame_idx = uniform_sampled_frames.tolist()
+        sampling_message = (
+            "[VIDEOMME SAMPLING] "
+            f"path={video_path if isinstance(video_path, str) else video_path[0]} "
+            f"duration_seconds={float(total_frame_num / vr.get_avg_fps()):.6f} "
+            f"source_fps={float(vr.get_avg_fps()):.6f} "
+            f"requested_fps={self.fps} "
+            f"actual_fps={actual_fps if self.fps is not None else 'max_frames'} "
+            f"sampled_frames={len(frame_idx)}"
+        )
+        self._last_sampling_message = sampling_message
+        if os.getenv("STREAMINGTOM_LOG_SAMPLING", "0") == "1":
+            # ``eval_logger`` is not consistently configured by all lmms-eval
+            # entry points.  Keep a plain stdout audit record in the tee'd run
+            # log so FPS ablations can be verified from their artifacts.
+            eval_logger.info(sampling_message)
+            print(sampling_message, flush=True)
         spare_frames = vr.get_batch(frame_idx).asnumpy()
         # Keep the exact sampled timestamps alongside the CPU frame tensor so
         # causal BEATs windows can end at the corresponding visual times.
@@ -514,11 +535,44 @@ class Llava_OneVision(lmms):
                         image_tensor = []
                         audio_info = None
                         try:
-                            if self.video_decode_backend == "decord":
-                                frames = self.load_video(visual, self.max_frames_num)
-                            elif self.video_decode_backend == "pyav":
-                                frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
-                            frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].half()
+                            video_cache_key = (
+                                str(visual[0]), str(self.fps), int(self.max_frames_num),
+                                str(self.video_decode_backend),
+                            )
+                            video_cache_enabled = (
+                                os.getenv("STREAMINGTOM_VIDEO_TENSOR_CACHE", "0") == "1"
+                                and getattr(self.model, "_streamingtom_direct_backend", False)
+                            )
+                            cached_video = getattr(self, "_streamingtom_video_tensor_cache", None)
+                            if (
+                                video_cache_enabled
+                                and cached_video is not None
+                                and cached_video["key"] == video_cache_key
+                            ):
+                                frames = cached_video["pixel_values"]
+                                self._last_video_path = cached_video["video_path"]
+                                self._last_video_timestamps = cached_video["timestamps"]
+                                if os.getenv("STREAMINGTOM_LOG_SAMPLING", "0") == "1":
+                                    print(cached_video["sampling_message"], flush=True)
+                            else:
+                                if self.video_decode_backend == "decord":
+                                    raw_frames = self.load_video(visual, self.max_frames_num)
+                                elif self.video_decode_backend == "pyav":
+                                    raw_frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
+                                frames = self._image_processor.preprocess(
+                                    raw_frames, return_tensors="pt"
+                                )["pixel_values"].half()
+                                if video_cache_enabled:
+                                    # Keep exactly one processed video on CPU. VideoMME
+                                    # requests are ordered by videoID, so this removes
+                                    # duplicate work without an unbounded host cache.
+                                    self._streamingtom_video_tensor_cache = {
+                                        "key": video_cache_key,
+                                        "pixel_values": frames,
+                                        "video_path": self._last_video_path,
+                                        "timestamps": self._last_video_timestamps.copy(),
+                                        "sampling_message": self._last_sampling_message,
+                                    }
                             image_tensor.append(frames)
                             if getattr(self.model, "_audio_bottleneck_requires_audio", False):
                                 audio_info = self.model.encode_audio_from_video(

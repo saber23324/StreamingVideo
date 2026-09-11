@@ -27,13 +27,15 @@ def setup_llava_with_streamingtom(model: nn.Module, streamingtom_config) -> nn.M
             visual_dim = getattr(getattr(model_instance, 'config', None), 'hidden_size', None)
         if visual_dim is None:
             raise ValueError('Cannot infer LLaVA hidden size for audio bottleneck')
-        model.audio_encoder = BEATsAudioEncoder(
-            checkpoint_path=streamingtom_config.get('beats_checkpoint', ''),
-            sample_rate=streamingtom_config.get('audio_sample_rate', 16000),
-            window_seconds=streamingtom_config.get('audio_window_seconds', 2.0),
-            batch_size=streamingtom_config.get('beats_batch_size', 8),
-            output_mode='temporal' if architecture == 'phase4' else 'mean',
-        )
+        model.audio_encoder = None
+        if stage >= 2:
+            model.audio_encoder = BEATsAudioEncoder(
+                checkpoint_path=streamingtom_config.get('beats_checkpoint', ''),
+                sample_rate=streamingtom_config.get('audio_sample_rate', 16000),
+                window_seconds=streamingtom_config.get('audio_window_seconds', 2.0),
+                batch_size=streamingtom_config.get('beats_batch_size', 8),
+                output_mode='temporal' if architecture == 'phase4' else 'mean',
+            )
         model.audio_bottleneck = AudioConditionedBottleneck(
             visual_dim=int(visual_dim),
             num_queries=streamingtom_config.get('audio_bottleneck_num_queries', 32),
@@ -51,6 +53,15 @@ def setup_llava_with_streamingtom(model: nn.Module, streamingtom_config) -> nn.M
         if adapter_checkpoint:
             checkpoint = torch.load(adapter_checkpoint, map_location='cpu', weights_only=False)
             checkpoint_args = checkpoint.get('args', {})
+            checkpoint_stage = int(
+                checkpoint_args.get('bottleneck_stage', 3)
+                if isinstance(checkpoint_args, dict) else 3
+            )
+            if checkpoint_stage != stage:
+                raise RuntimeError(
+                    'ADBT checkpoint stage does not match runtime config: '
+                    f'checkpoint={checkpoint_stage} runtime={stage}'
+                )
             checkpoint_architecture = (
                 checkpoint_args.get('architecture', 'legacy')
                 if isinstance(checkpoint_args, dict) else 'legacy'
@@ -348,12 +359,14 @@ def _generate_with_direct_adbt(self, input_ids, images, **kwargs):
     else:
         latents = _encode_direct_adbt_latents(self, images, audio_info)
         if cache_key is not None:
-            # Cache on CPU so evaluation reuse cannot increase peak GPU memory.
-            # The cap covers the 180-video held-out split while remaining
-            # bounded for other invocations.
-            if len(latent_cache) >= 256:
-                latent_cache.pop(next(iter(latent_cache)))
-            latent_cache[cache_key] = latents.detach().cpu()
+            # VideoMME's three questions for a video are contiguous. Retaining
+            # older videos can consume tens of GiB of host RAM at high FPS and
+            # provides no reuse, so this cache is deliberately one-video-only.
+            # Move the live tensor to CPU as well; otherwise the first question
+            # keeps both the float32 source and float16 decoder copy on GPU.
+            latents = latents.detach().cpu()
+            latent_cache.clear()
+            latent_cache[cache_key] = latents
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
     if input_ids.shape[0] != 1:
@@ -379,11 +392,16 @@ def _generate_with_direct_adbt(self, input_ids, images, **kwargs):
             inputs_embeds.shape[1], dtype=torch.long, device=device
         ).unsqueeze(0)
 
-    # For the frozen full-visual baseline, cache the identical prefix shared by
-    # the three VideoMME questions. Requests are kept in dataset order by the
-    # lmms-eval wrapper, so only one video's KV is resident at a time. This is
-    # exact prefix reuse: no quantization, selection, or retrieval is involved.
-    if not getattr(self, '_audio_bottleneck_enabled', False) and cache_key is not None:
+    # Cache the identical visual prefix shared by the three VideoMME questions.
+    # Full Vision keeps its established default.  ADBT must be explicitly
+    # enabled after an answer-equivalence smoke test because its long-video KV
+    # is large. This is exact prefix reuse: latents, prompt suffix, decoding,
+    # and metric are unchanged; audio still never enters the LLM.
+    prefix_cache_enabled = (
+        not getattr(self, '_audio_bottleneck_enabled', False)
+        or os.getenv('STREAMINGTOM_PREFIX_KV_CACHE', '0') == '1'
+    )
+    if prefix_cache_enabled and cache_key is not None:
         prefix_cache_key = cache_key + (tuple(int(value) for value in input_ids[0, :marker]),)
         prefix_past = None
         if getattr(self, '_direct_prefix_cache_key', None) == prefix_cache_key:
@@ -391,25 +409,49 @@ def _generate_with_direct_adbt(self, input_ids, images, **kwargs):
         else:
             common_embeds = torch.cat((prefix, latent_embeds), dim=1)
             common_length = common_embeds.shape[1]
-            common_mask = torch.ones(
-                (1, common_length), dtype=torch.long, device=device
+            prefill_chunk_size = int(
+                os.getenv('STREAMINGTOM_PREFIX_PREFILL_CHUNK_SIZE', '0')
             )
-            common_positions = torch.arange(
-                common_length, dtype=torch.long, device=device
-            ).unsqueeze(0)
-            with torch.inference_mode():
-                # Call the decoder backbone, not the CausalLM head. The prefix
-                # needs only KV; projecting every one of ~100k visual positions
-                # to the 152k-token vocabulary can allocate tens of GiB of
-                # logits and OOM even though the KV itself fits comfortably.
-                prefix_outputs = self.get_model()(
-                    inputs_embeds=common_embeds,
-                    attention_mask=common_mask,
-                    position_ids=common_positions,
-                    use_cache=True,
-                    return_dict=True,
+            # Call the decoder backbone, not the CausalLM head. The prefix
+            # needs only KV; projecting every visual position to the vocabulary
+            # would allocate tens of GiB of logits. Optional chronological
+            # chunking further bounds decoder activations while constructing
+            # exactly the same causal KV prefix.
+            if 0 < prefill_chunk_size < common_length:
+                prefix_past = None
+                with torch.inference_mode():
+                    for start in range(0, common_length, prefill_chunk_size):
+                        end = min(start + prefill_chunk_size, common_length)
+                        prefix_outputs = self.get_model()(
+                            inputs_embeds=common_embeds[:, start:end],
+                            attention_mask=torch.ones(
+                                (1, end), dtype=torch.long, device=device
+                            ),
+                            position_ids=torch.arange(
+                                start, end, dtype=torch.long, device=device
+                            ).unsqueeze(0),
+                            past_key_values=prefix_past,
+                            use_cache=True,
+                            return_dict=True,
+                        )
+                        prefix_past = prefix_outputs.past_key_values
+                        del prefix_outputs
+            else:
+                common_mask = torch.ones(
+                    (1, common_length), dtype=torch.long, device=device
                 )
-            prefix_past = prefix_outputs.past_key_values
+                common_positions = torch.arange(
+                    common_length, dtype=torch.long, device=device
+                ).unsqueeze(0)
+                with torch.inference_mode():
+                    prefix_outputs = self.get_model()(
+                        inputs_embeds=common_embeds,
+                        attention_mask=common_mask,
+                        position_ids=common_positions,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                prefix_past = prefix_outputs.past_key_values
             if hasattr(prefix_past, 'to_legacy_cache'):
                 prefix_past = prefix_past.to_legacy_cache()
             self._direct_prefix_cache_key = prefix_cache_key

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import subprocess
@@ -37,6 +38,7 @@ class BEATsAudioEncoder(nn.Module):
         batch_size: int = 8,
         beats_root: str = "/home/yxd/StreamingTOM/unilm/beats",
         output_mode: str = "temporal",
+        cache_dir: str = "",
     ):
         super().__init__()
         if output_mode not in ("temporal", "mean"):
@@ -49,6 +51,10 @@ class BEATsAudioEncoder(nn.Module):
         self.output_mode = output_mode
         self.checkpoint_path = self._resolve_checkpoint(checkpoint_path)
         self.beats_root = Path(beats_root)
+        configured_cache = cache_dir or os.getenv("BEATS_EMBEDDING_CACHE", "")
+        self.cache_dir = Path(configured_cache).expanduser() if configured_cache else None
+        self._cache_hits = 0
+        self._cache_misses = 0
         self.beats = None
         self.source = "diagnostic_fallback"
 
@@ -184,6 +190,74 @@ class BEATsAudioEncoder(nn.Module):
         # statistics are a BEATs token sequence.
         return features.unsqueeze(1) if self.output_mode == "temporal" else features
 
+    def _embedding_cache_path(
+        self, audio_source_path: str, timestamps: torch.Tensor
+    ) -> Path | None:
+        cache_dir = getattr(self, "cache_dir", None)
+        if cache_dir is None or self.beats is None:
+            return None
+        source_path = Path(audio_source_path).resolve()
+        source_stat = source_path.stat()
+        checkpoint_path = Path(self.checkpoint_path).resolve()
+        checkpoint_stat = checkpoint_path.stat()
+        digest = hashlib.sha256()
+        digest.update(str(source_path).encode("utf-8"))
+        digest.update(f"{source_stat.st_size}:{source_stat.st_mtime_ns}".encode("ascii"))
+        digest.update(str(checkpoint_path).encode("utf-8"))
+        digest.update(
+            f"{checkpoint_stat.st_size}:{checkpoint_stat.st_mtime_ns}".encode("ascii")
+        )
+        digest.update(
+            f"{self.sample_rate}:{self.window_seconds}:{self.output_mode}".encode("ascii")
+        )
+        digest.update(timestamps.contiguous().numpy().tobytes())
+        return cache_dir / digest.hexdigest()[:2] / f"{digest.hexdigest()}.pt"
+
+    def _load_embedding_cache(
+        self, cache_path: Path | None, timestamps: torch.Tensor
+    ) -> torch.Tensor | None:
+        if cache_path is None or not cache_path.is_file():
+            return None
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+            cached_timestamps = payload["end_timestamps"]
+            embeddings = payload["embeddings"]
+            if not torch.equal(cached_timestamps, timestamps):
+                raise ValueError("timestamp mismatch")
+            if embeddings.shape[0] != timestamps.numel():
+                raise ValueError("embedding count mismatch")
+            self._cache_hits = getattr(self, "_cache_hits", 0) + 1
+            if self._cache_hits == 1 or self._cache_hits % 100 == 0:
+                LOGGER.info(
+                    "BEATs embedding cache hit=%d miss=%d path=%s",
+                    self._cache_hits,
+                    getattr(self, "_cache_misses", 0),
+                    cache_path,
+                )
+            return embeddings.float()
+        except (OSError, KeyError, RuntimeError, ValueError) as exc:
+            LOGGER.warning("Ignoring invalid BEATs cache entry %s: %s", cache_path, exc)
+            return None
+
+    def _save_embedding_cache(
+        self,
+        cache_path: Path | None,
+        timestamps: torch.Tensor,
+        embeddings: torch.Tensor,
+    ) -> None:
+        if cache_path is None:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+        torch.save(
+            {
+                "end_timestamps": timestamps.cpu(),
+                "embeddings": embeddings.float().cpu(),
+            },
+            temporary_path,
+        )
+        os.replace(temporary_path, cache_path)
+
     @torch.inference_mode()
     def encode_windows(self, windows: torch.Tensor, device: torch.device) -> torch.Tensor:
         if self.beats is None:
@@ -241,9 +315,14 @@ class BEATsAudioEncoder(nn.Module):
                     "crossvideo ablation requires an explicit crossvideo_path"
                 )
             audio_source_path = str(crossvideo_path)
-        waveform = self.decode_audio(audio_source_path, self.sample_rate)
-        windows = self._causal_windows(waveform, timestamps)
-        embeddings = self.encode_windows(windows, device=device)
+        cache_path = self._embedding_cache_path(audio_source_path, timestamps)
+        embeddings = self._load_embedding_cache(cache_path, timestamps)
+        if embeddings is None:
+            self._cache_misses = getattr(self, "_cache_misses", 0) + 1
+            waveform = self.decode_audio(audio_source_path, self.sample_rate)
+            windows = self._causal_windows(waveform, timestamps)
+            embeddings = self.encode_windows(windows, device=device)
+            self._save_embedding_cache(cache_path, timestamps, embeddings)
 
         if ablation == "zero":
             embeddings.zero_()

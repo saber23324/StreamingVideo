@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -72,6 +74,41 @@ class BEATsTemporalTokensTest(unittest.TestCase):
         decode_audio.assert_called_once_with("wrong.mp4", 16000)
         self.assertEqual(result["audio_source_path"], "wrong.mp4")
         self.assertEqual(result["ablation"], "crossvideo")
+
+    def test_frozen_embedding_cache_is_exact_and_keyed_by_timestamps(self):
+        encoder = make_encoder("temporal")
+        encoder.sample_rate = 16000
+        encoder.window_seconds = 2.0
+        encoder.source = "beats"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "video.mp4"
+            checkpoint = root / "beats.pt"
+            video.write_bytes(b"video")
+            checkpoint.write_bytes(b"checkpoint")
+            encoder.checkpoint_path = str(checkpoint)
+            encoder.cache_dir = root / "cache"
+            encoder._cache_hits = 0
+            encoder._cache_misses = 0
+            expected = torch.randn(2, 5, 12)
+            with patch.object(
+                encoder, "decode_audio", return_value=torch.randn(64000)
+            ) as decode_audio, patch.object(
+                encoder, "encode_windows", return_value=expected.clone()
+            ) as encode_windows:
+                first = encoder.encode_video(
+                    str(video), [1.0, 2.0], torch.device("cpu")
+                )
+                second = encoder.encode_video(
+                    str(video), [1.0, 2.0], torch.device("cpu")
+                )
+
+            torch.testing.assert_close(first["embeddings"], expected)
+            torch.testing.assert_close(second["embeddings"], expected)
+            decode_audio.assert_called_once()
+            encode_windows.assert_called_once()
+            self.assertEqual(encoder._cache_misses, 1)
+            self.assertEqual(encoder._cache_hits, 1)
 
 
 if __name__ == "__main__":
