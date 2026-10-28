@@ -259,8 +259,55 @@ def init_wandb(args, split, train_rows):
     return run
 
 
-def make_split(dataset, split_file: Path, seed: int = 1234, train_fraction: float = 0.8):
+def make_split(
+    dataset,
+    split_file: Path,
+    seed: int = 1234,
+    train_fraction: float = 0.8,
+    *,
+    allow_train_test_overlap: bool = False,
+):
+    """Load an explicit split, or create one only when the file is absent.
+
+    Test entries must stay unique so evaluation coverage is unambiguous. Train
+    membership is consumed as a set by the trainer, matching its historical
+    one-presentation-per-video behavior.
+    """
     video_ids = sorted(set(str(x["videoID"]) for x in dataset))
+    known_ids = set(video_ids)
+    if split_file.is_file():
+        split = json.loads(split_file.read_text(encoding="utf-8"))
+        if set(split) != {"train", "test"}:
+            raise ValueError(
+                f"split file must contain exactly train/test lists: {split_file}"
+            )
+        if not isinstance(split["train"], list) or not isinstance(split["test"], list):
+            raise ValueError(f"split train/test values must be lists: {split_file}")
+        split = {
+            "train": [str(value) for value in split["train"]],
+            "test": [str(value) for value in split["test"]],
+        }
+        unknown = (set(split["train"]) | set(split["test"])) - known_ids
+        if unknown:
+            raise ValueError(
+                f"split contains {len(unknown)} video IDs absent from the dataset: "
+                f"{sorted(unknown)}"
+            )
+        if not split["train"] or not split["test"]:
+            raise ValueError(f"split train/test lists must both be non-empty: {split_file}")
+        duplicate_test = len(split["test"]) - len(set(split["test"]))
+        if duplicate_test:
+            raise ValueError(
+                f"split test list contains {duplicate_test} duplicate entries: {split_file}"
+            )
+        overlap = set(split["train"]) & set(split["test"])
+        if overlap and not allow_train_test_overlap:
+            raise ValueError(
+                f"split has {len(overlap)} train/test-overlap videos; pass "
+                "--allow-train-test-overlap only for an explicitly in-sample tuning run"
+            )
+        return split
+
     rng = random.Random(seed)
     rng.shuffle(video_ids)
     cut = int(len(video_ids) * train_fraction)
@@ -720,6 +767,8 @@ def evaluate_small_set(
 
 
 def train(args):
+    if args.hard_example_repeats < 1:
+        raise ValueError("--hard-example-repeats must be at least 1")
     if args.latent_norm is None:
         args.latent_norm = "none" if args.value_mode == "native" else "rmsnorm"
     if args.value_mode == "native" and args.latent_norm != "none":
@@ -785,9 +834,60 @@ def train(args):
             download_mode="reuse_dataset_if_exists",
         )["test"]
         args.dataset_name = "lmms-lab/Video-MME"
-    split = make_split(dataset, Path(args.split_file), args.seed, 0.8)
+    split = make_split(
+        dataset,
+        Path(args.split_file),
+        args.seed,
+        0.8,
+        allow_train_test_overlap=args.allow_train_test_overlap,
+    )
     train_ids = set(split["train"])
     train_rows = [row for row in dataset if str(row["videoID"]) in train_ids]
+    if args.hard_example_result:
+        hard_result = json.loads(
+            Path(args.hard_example_result).read_text(encoding="utf-8")
+        )
+        if "temperature_results" in hard_result:
+            temperature_key = str(args.hard_example_temperature)
+            if temperature_key not in hard_result["temperature_results"]:
+                available = sorted(hard_result["temperature_results"])
+                raise ValueError(
+                    f"hard-example temperature {temperature_key} not found; "
+                    f"available={available}"
+                )
+            hard_records = hard_result["temperature_results"][temperature_key][
+                "records"
+            ]
+        else:
+            hard_records = hard_result["records"]
+        hard_question_ids = {
+            str(record["question_id"])
+            for record in hard_records
+            if not bool(record["option_correct"])
+            and (
+                args.hard_example_max_margin <= 0
+                or float(record["option_top2_margin"])
+                <= args.hard_example_max_margin
+            )
+        }
+        train_rows = [
+            row
+            for row in train_rows
+            if str(row.get("question_id")) in hard_question_ids
+        ]
+        if not train_rows:
+            raise ValueError("hard-example filtering selected zero training rows")
+        train_rows = train_rows * args.hard_example_repeats
+        LOGGER.info(
+            "hard-example curriculum source=%s temperature=%s max_margin=%s "
+            "unique_questions=%d repeats=%d scheduled_rows=%d",
+            args.hard_example_result,
+            args.hard_example_temperature,
+            args.hard_example_max_margin,
+            len(hard_question_ids),
+            args.hard_example_repeats,
+            len(train_rows),
+        )
     if args.max_train_samples:
         train_rows = train_rows[: args.max_train_samples]
     LOGGER.info(
@@ -1001,6 +1101,12 @@ def train(args):
     rows_by_video = {}
     for row in train_rows:
         rows_by_video.setdefault(str(row["videoID"]), []).append(row)
+    duplicate_entries = len(split["train"]) - len(set(split["train"]))
+    if duplicate_entries:
+        LOGGER.warning(
+            "split contains %d duplicate train entries; set membership deduplicates them",
+            duplicate_entries,
+        )
     skipped_videos = {str(value) for value in args.skip_video}
     unknown_skips = skipped_videos - set(rows_by_video)
     if unknown_skips:
@@ -1905,6 +2011,40 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--train-max-frames", type=int, default=32)
+    parser.add_argument(
+        "--hard-example-result",
+        default="",
+        help=(
+            "Optional prior eval JSON used to retain only incorrectly predicted "
+            "training questions. Intended for explicitly disclosed in-sample curricula."
+        ),
+    )
+    parser.add_argument(
+        "--hard-example-temperature",
+        type=float,
+        default=0.05,
+        help="Temperature key to select from a multi-temperature eval JSON.",
+    )
+    parser.add_argument(
+        "--hard-example-max-margin",
+        type=float,
+        default=0.0,
+        help="Keep wrong examples with top-2 option margin at most this value; <=0 keeps all.",
+    )
+    parser.add_argument(
+        "--hard-example-repeats",
+        type=int,
+        default=1,
+        help="Repeat each selected hard-example row this many times per curriculum epoch.",
+    )
+    parser.add_argument(
+        "--allow-train-test-overlap",
+        action="store_true",
+        help=(
+            "Allow an explicit split to place videos in both train and test. "
+            "This is intended only for disclosed in-sample tuning experiments."
+        ),
+    )
     parser.add_argument(
         "--skip-video",
         action="append",

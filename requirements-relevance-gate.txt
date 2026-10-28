@@ -1,0 +1,5 @@
+# Install in a venv inheriting the verified streamingtom environment; do not
+# replace the existing torch / transformers / native AudioRouter dependencies.
+# ImageBind models are loaded without its unused PyTorchVideo data loader.
+iopath==0.1.10
+gdown==6.4.2

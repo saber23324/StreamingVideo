@@ -1,5 +1,26 @@
 # [CVPR 2026] StreamingTOM: Streaming Token Compression for Efficient Video Understanding
 
+> 最新完成[数据补全与双头实际训练](utility_gate/dual_head/proxy/README.md)：
+> LLP Validation密集标注、203条Robust错配、六组小模型及新来源确认评价，
+> [完整报告](reports/DUAL_HEAD_PROXY_EXPERIMENT_20261028.md)。新LLP代理AUROC0.825，
+> 新128题QA固定视觉/Dual-LLP均108，混合双头107，未超过视觉；204项测试通过，旧权重和归档保留。
+>
+> 前一阶段按 [Dual-Head 文档](AGENTS_DUAL_HEAD_GATE.md) 完成 M0/M1 审计、双头工程与一次 Utility-only 诊断：
+> [实际分析与结果](reports/DUAL_HEAD_GATE_20261027.md)。可信对应关系负例为0，语义双头训练与新benchmark评测未运行；
+> Utility 验证未超过常量基线。192项CPU测试及真实GPU兼容检查通过，旧权重和归档保留。
+>
+> 前一阶段按 [Grounding 验证文档](AGENTS_GATE2_GROUNDING_VALIDATION.md) 完成空间、时间与独立QA验证：
+> [实际运行报告](reports/GATE2_GROUNDING_VALIDATION_20261027.md)。109个有效空间配对显示正的声源ROI偏置，
+> LLP共同事件区分近随机，新197题QA未超过固定视觉。冻结原模型，旧Gate2结果保留。
+>
+> 前一阶段按 [AGENTS_gate2.md](AGENTS_gate2.md) 在现有 AudioRouter 上开发
+> [Visual-Anchored Utility Gate](utility_gate/README.md)。使用正式训练来源的 QA 自动监督，无需人工音画对应性审核。
+> [Gate2 实验报告](reports/GATE2_EXPERIMENT_RESULTS_20261027.md)：AVQA 256题 Gate/视觉均86.72%；
+> 64题逐时刻测试 Gate84.38%、视觉87.50%，当前未观察到超过固定视觉的收益。151项自动测试通过。
+> [上一轮 Utility Gate](docs/UTILITY_GATE_RUN_20261026.md) 作为历史结果保留；
+> [之前的对应性实验](docs/RELEVANCE_GATE_PROGRESS.md) 和 [原模型通路](docs/legacy-path-map.md) 保留。
+> 下面保留原 StreamingTOM 的说明。
+
 [![arXiv](https://img.shields.io/badge/arXiv-2510.18269-b31b1b.svg)](https://arxiv.org/abs/2510.18269)
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://yige24.github.io/StreamingTOM)
 

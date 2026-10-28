@@ -1,17 +1,18 @@
 # ADBT 最新权重、训练、验证与可视化指南
 
-更新时间：2026-09-12（Asia/Shanghai）
+更新时间：2026-09-13（Asia/Shanghai）
 
 本文是当前项目的统一入口，覆盖：
 
 - VideoMME；
-- MLVU Ego（本地已下载子集）；
+- MLVU Ego 和完整七任务 MCQA；
 - StreamingBench Real-Time Visual Understanding（本地已下载子集）；
 - 三个数据集的训练、正式验证和 Where-to-Look heatmap 命令。
 
 本文中的“SOTA”表示**当前仓库已有实验中的项目内最佳 checkpoint**，不是对外部
 公开榜单或完整 benchmark 的 SOTA 声明。VideoMME 数字来自按 `videoID` 划分的
-20% held-out 集；MLVU 和 StreamingBench 只覆盖当前机器本地下载的指定子任务。
+20% held-out 集；MLVU Full 覆盖本机完整下载的七个选择题任务（两个自由生成任务不计
+A--D accuracy），StreamingBench 覆盖本地 Real-Time 子任务。
 
 ## 1. 当前最佳权重
 
@@ -19,6 +20,7 @@
 |---|---|---|---|---:|
 | VideoMME | `results/adbt-phase4.1-q64-tau005-epoch3-lr1e5/adbt_epoch_3.pt` | `1230ce639c8621ffcbb9d3d906179a454a1015475f0ee1b7d3957dc50ce631ec` | real audio，推理 tau=0.03 | 60.1852%（325/540） |
 | MLVU Ego | `results/mlvu_ego_adbt_q64_tau005_epoch3_lr1e5/adbt_epoch_3.pt` | `53835943f7d21129520ac532c05c169f422a40b617bb39949dddbae6e4313a1d` | real audio，推理 tau=0.03 | 69.3548%（43/62） |
+| MLVU Full MCQA | `results/mlvu_full_mcqa_q64_tau005_from_ego_epoch3_lr1e5/adbt_epoch_2.pt` | `043b2c7227d841197244816db3c8032f671e4d7e8671b20617f3a41c721cb999` | real audio，推理 tau=0.015 | 67.8322%（291/429） |
 | StreamingBench Real-Time | `results/streamingbench_realtime_adbt_q64_tau005_epoch3_lr1e5/adbt_epoch_3.pt` | `d388e6d3caa35dae619aafb5dac4e65afc39a2d81168da23935a65f5ae97a3a2` | real audio，推理 tau=0.05 | 67.0000%（335/500） |
 
 ### VideoMME 分长度结果
@@ -52,6 +54,31 @@ peak reserved = cuda:0 12,744 MiB / cuda:1 17,832 MiB
 结果文件：
 `results/mlvu_ego_adbt_q64_tau003_epoch3_eval.json`。
 
+### MLVU Full MCQA 结果
+
+2026-09-13 从上述 Ego checkpoint 初始化，在七个 MLVU-dev 选择题任务的无媒体泄漏
+train split 上训练到 3 epoch。epoch 2 是最佳点，正式 validation 得到：
+
+```text
+291 / 429 = 67.8322%
+mean QA loss = 0.882342
+sampled frames = 71,509
+peak allocated = cuda:0 19,147.2 MiB / cuda:1 25,347.9 MiB
+peak reserved = cuda:0 20,384 MiB / cuda:1 26,428 MiB
+```
+
+结果文件：
+`results/mlvu_full_mcqa_epoch2_tau0015_full_eval.json`。
+`sub_scene` 和 `summary` 是自由生成任务，不进入 A--D accuracy。划分、分任务结果、
+命令和音频异常说明见 `docs/MLVU_FULL_MCQA_20260912.md`；epoch/temperature sweep、
+哈希和新最佳结果见 `docs/MLVU_FULL_MCQA_TUNING_20260913.md`。epoch 3 在相同
+tau=0.015 下回落到 276/429，故不继续盲目训练到 epoch 10。
+
+若允许按已知任务类型设置推理温度，同一个 epoch 2 checkpoint 对 Needle 使用
+tau=0.01、其余任务使用 tau=0.015，可得到 tuned/in-sample 292/429（68.0653%）；
+相对 epoch 1 六项提升、Needle 持平。该结果是在同一 validation 上选温度，不替换
+上表的固定温度主结果。组合记录与审计见上述 20260913 文档。
+
 ### StreamingBench Real-Time 结果
 
 ```text
@@ -69,6 +96,12 @@ peak reserved = cuda:0 11,704 MiB / cuda:1 20,928 MiB
 旧文件 `streamingbench_realtime_adbt_q64_tau003_epoch3_eval_by_task_rerun.json`
 中的 334/500 对应 checkpoint 被覆盖前的旧权重，不应再用当前路径解释它。当前
 67.00% 结果与当前 `d388...a3a2` checkpoint 匹配。
+
+2026-09-12 使用恢复的 tuning split、保持 train set 去重语义并从上述 checkpoint
+续训一个 epoch 后，完整 500 题达到 337/500（67.40%）。该 split 有 15 个视频同时
+位于 train/test，因此这是显式披露的 tuned/in-sample 结果，不替换上表的独立
+held-out 口径。完整命令、哈希和 overlap/non-overlap 审计见
+`docs/STREAMINGBENCH_TUNED_SPLIT_20260912.md`。
 
 这里的 `cuda:0/cuda:1` 是设置 `CUDA_VISIBLE_DEVICES=6,7` 后的逻辑编号，分别映射
 到物理 GPU 6/7。VideoMME 的这组三个历史 lmms-eval JSON 没有保存 peak-memory
@@ -158,6 +191,7 @@ export CUDA_VISIBLE_DEVICES=6,7
 |---|---|---|---|
 | VideoMME | `/home/yxd/.cache/huggingface/videomme/data` | Hugging Face 本地缓存 | `results/adbt_videomme_split.json` |
 | MLVU Ego | `/home/yxd/pkt/huggingface/hub/datasets--MLVU--MVLU/snapshots/06ddc388aa34746b3abba77972b7a7dfd977f7a3` | `results/dataset_manifests/mlvu_ego.json` | `results/dataset_splits/mlvu_ego_seed1234_80_20.json` |
+| MLVU Full MCQA | 同上 | `results/dataset_manifests/mlvu_full_mcqa.json` | `results/dataset_splits/mlvu_full_mcqa_seed1234_pathgroup_80_20.json` |
 | StreamingBench Real-Time | `/home/yxd/pkt/streaming/dataset` | `results/dataset_manifests/streamingbench_realtime.json` | `results/dataset_splits/streamingbench_realtime_seed1234_80_20.json` |
 
 划分规模：
@@ -166,6 +200,7 @@ export CUDA_VISIBLE_DEVICES=6,7
 |---|---:|---:|
 | VideoMME | 720 videos / 2,160 QA | 180 videos / 540 QA |
 | MLVU Ego | 67 videos / 290 QA | 17 videos / 62 QA |
+| MLVU Full MCQA | 992 task-video IDs / 1,745 QA | 250 task-video IDs / 429 QA |
 | StreamingBench Real-Time | 400 videos / 1,999 valid QA | 100 videos / 500 QA |
 
 StreamingBench 的 `sample_242_1` 因标注时间超过视频长度被 manifest 排除。

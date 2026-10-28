@@ -83,6 +83,31 @@ def evaluate(args) -> dict:
         parameter.requires_grad_(False)
 
     visual_dim = int(model.config.hidden_size)
+    if args.attention_temperatures:
+        temperatures = [
+            float(value.strip())
+            for value in args.attention_temperatures.split(",")
+            if value.strip()
+        ]
+        if not temperatures:
+            raise ValueError("--attention-temperatures must contain at least one value")
+        if args.attention_temperature is not None:
+            raise ValueError(
+                "use either --attention-temperature or --attention-temperatures, not both"
+            )
+    else:
+        temperatures = [
+            float(
+                args.attention_temperature
+                if args.attention_temperature is not None
+                else saved_args.get("attention_temperature", 0.05)
+            )
+        ]
+    if len(set(temperatures)) != len(temperatures):
+        raise ValueError("--attention-temperatures contains duplicate values")
+    if any(value <= 0 for value in temperatures):
+        raise ValueError("attention temperatures must be positive")
+
     adbt = AudioConditionedBottleneck(
         visual_dim=visual_dim,
         num_queries=int(saved_args.get("num_queries", 64)),
@@ -92,11 +117,7 @@ def evaluate(args) -> dict:
         latent_norm=saved_args.get("latent_norm", "none"),
         value_mode=saved_args.get("value_mode", "native"),
         architecture=saved_args.get("architecture", "phase4"),
-        attention_temperature=float(
-            args.attention_temperature
-            if args.attention_temperature is not None
-            else saved_args.get("attention_temperature", 0.05)
-        ),
+        attention_temperature=temperatures[0],
     )
     missing, unexpected = adbt.load_state_dict(checkpoint["audio_bottleneck"], strict=False)
     if missing or unexpected:
@@ -110,7 +131,7 @@ def evaluate(args) -> dict:
         output_mode="temporal",
     )
     answer_option_ids = option_token_ids(tokenizer)
-    records = []
+    records_by_temperature = {temperature: [] for temperature in temperatures}
     frames_seen = 0
 
     with torch.no_grad():
@@ -127,58 +148,82 @@ def evaluate(args) -> dict:
             )
             audio_embeddings = audio["embeddings"].to(visual.device, dtype=torch.float32)
             audio_timestamps = audio["end_timestamps"].to(visual.device)
-            latents, _ = adbt(
-                visual.float(),
-                audio_embeddings=audio_embeddings,
-                end_timestamps=audio_timestamps,
-            )
             frames_seen += len(timestamps)
-            for row_index, row in enumerate(video_rows):
-                positions = torch.as_tensor(
-                    row_frame_positions[row_index], device=latents.device
+            for temperature in temperatures:
+                adbt.attention_temperature = temperature
+                latents, _ = adbt(
+                    visual.float(),
+                    audio_embeddings=audio_embeddings,
+                    end_timestamps=audio_timestamps,
                 )
-                prefix_frames = int(positions.numel())
-                prompt_ids = make_prompt(row, tokenizer)
-                embeds, labels, mask = build_inputs(
-                    model,
-                    tokenizer,
-                    prompt_ids,
-                    row["answer"],
-                    latents.index_select(0, positions),
-                )
-                output = model.model(
-                    inputs_embeds=embeds,
-                    attention_mask=mask,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                shifted_labels = labels[:, 1:].to(output.last_hidden_state.device)
-                answer_mask = shifted_labels.ne(-100)
-                answer_hidden = output.last_hidden_state[:, :-1][answer_mask]
-                answer_labels = shifted_labels[answer_mask]
-                logits = model.lm_head(answer_hidden)[0].float()
-                loss = F.cross_entropy(logits[None], answer_labels[:1])
-                greedy_token = int(logits.argmax().item())
-                greedy_text = tokenizer.decode([greedy_token]).strip()
-                option_index = int(logits[answer_option_ids.to(logits.device)].argmax().item())
-                option_prediction = "ABCD"[option_index]
-                target = str(row["answer"]).strip().upper()
-                records.append(
-                    {
-                        "dataset": manifest.get("dataset_name"),
-                        "videoID": video_id,
-                        "question_id": row.get("question_id"),
-                        "task_type": row.get("task_type"),
-                        "query_time_seconds": row.get("query_time_seconds"),
-                        "sampled_prefix_frames": prefix_frames,
-                        "target": target,
-                        "greedy_prediction": greedy_text,
-                        "greedy_correct": greedy_text == target,
-                        "option_prediction": option_prediction,
-                        "option_correct": option_prediction == target,
-                        "loss": float(loss.cpu()),
-                    }
-                )
+                records = records_by_temperature[temperature]
+                for row_index, row in enumerate(video_rows):
+                    positions = torch.as_tensor(
+                        row_frame_positions[row_index], device=latents.device
+                    )
+                    prefix_frames = int(positions.numel())
+                    prompt_ids = make_prompt(row, tokenizer)
+                    embeds, labels, mask = build_inputs(
+                        model,
+                        tokenizer,
+                        prompt_ids,
+                        row["answer"],
+                        latents.index_select(0, positions),
+                    )
+                    output = model.model(
+                        inputs_embeds=embeds,
+                        attention_mask=mask,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    shifted_labels = labels[:, 1:].to(output.last_hidden_state.device)
+                    answer_mask = shifted_labels.ne(-100)
+                    answer_hidden = output.last_hidden_state[:, :-1][answer_mask]
+                    answer_labels = shifted_labels[answer_mask]
+                    logits = model.lm_head(answer_hidden)[0].float()
+                    loss = F.cross_entropy(logits[None], answer_labels[:1])
+                    greedy_token = int(logits.argmax().item())
+                    greedy_text = tokenizer.decode([greedy_token]).strip()
+                    selected_option_logits = logits[
+                        answer_option_ids.to(logits.device)
+                    ].float()
+                    option_probabilities = selected_option_logits.softmax(dim=0)
+                    option_index = int(selected_option_logits.argmax().item())
+                    option_prediction = "ABCD"[option_index]
+                    top_values = selected_option_logits.topk(k=2).values
+                    target = str(row["answer"]).strip().upper()
+                    records.append(
+                        {
+                            "dataset": manifest.get("dataset_name"),
+                            "videoID": video_id,
+                            "question_id": row.get("question_id"),
+                            "task_type": row.get("task_type"),
+                            "query_time_seconds": row.get("query_time_seconds"),
+                            "sampled_prefix_frames": prefix_frames,
+                            "target": target,
+                            "greedy_prediction": greedy_text,
+                            "greedy_correct": greedy_text == target,
+                            "option_prediction": option_prediction,
+                            "option_correct": option_prediction == target,
+                            "option_logits": {
+                                letter: float(value)
+                                for letter, value in zip(
+                                    "ABCD", selected_option_logits.detach().cpu().tolist()
+                                )
+                            },
+                            "option_probabilities": {
+                                letter: float(value)
+                                for letter, value in zip(
+                                    "ABCD", option_probabilities.detach().cpu().tolist()
+                                )
+                            },
+                            "option_top2_margin": float(
+                                (top_values[0] - top_values[1]).detach().cpu()
+                            ),
+                            "loss": float(loss.cpu()),
+                        }
+                    )
+                del latents
             LOGGER.info(
                 "video=%d/%d id=%s frames=%d questions=%d",
                 video_index,
@@ -187,32 +232,43 @@ def evaluate(args) -> dict:
                 len(timestamps),
                 len(video_rows),
             )
-            del visual, audio, audio_embeddings, audio_timestamps, latents, frames
+            del visual, audio, audio_embeddings, audio_timestamps, frames
             torch.cuda.empty_cache()
 
-    summary = summarize(records)
-    summary.update(
-        {
-            "dataset": manifest.get("dataset_name"),
-            "manifest": str(Path(args.dataset_manifest).resolve()),
-            "split_file": str(Path(args.split_file).resolve()),
-            "checkpoint": str(Path(args.checkpoint).resolve()),
-            "test_videos": len(rows_by_video),
-            "sampled_frames": frames_seen,
-            "fps": args.fps,
-            "max_frames": args.max_frames,
-            "audio_ablation": args.audio_ablation,
-            "cuda_peak_allocated_mib": {
-                str(index): torch.cuda.max_memory_allocated(index) / 1024**2
-                for index in range(torch.cuda.device_count())
-            },
-            "cuda_peak_reserved_mib": {
-                str(index): torch.cuda.max_memory_reserved(index) / 1024**2
-                for index in range(torch.cuda.device_count())
-            },
-            "records": records,
-        }
-    )
+    metadata = {
+        "dataset": manifest.get("dataset_name"),
+        "manifest": str(Path(args.dataset_manifest).resolve()),
+        "split_file": str(Path(args.split_file).resolve()),
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "test_videos": len(rows_by_video),
+        "sampled_frames": frames_seen,
+        "fps": args.fps,
+        "max_frames": args.max_frames,
+        "audio_ablation": args.audio_ablation,
+        "cuda_peak_allocated_mib": {
+            str(index): torch.cuda.max_memory_allocated(index) / 1024**2
+            for index in range(torch.cuda.device_count())
+        },
+        "cuda_peak_reserved_mib": {
+            str(index): torch.cuda.max_memory_reserved(index) / 1024**2
+            for index in range(torch.cuda.device_count())
+        },
+    }
+    if len(temperatures) == 1:
+        records = records_by_temperature[temperatures[0]]
+        summary = summarize(records)
+        summary.update(metadata)
+        summary["attention_temperature"] = temperatures[0]
+        summary["records"] = records
+    else:
+        summary = dict(metadata)
+        summary["attention_temperatures"] = temperatures
+        summary["temperature_results"] = {}
+        for temperature in temperatures:
+            records = records_by_temperature[temperature]
+            result = summarize(records)
+            result["records"] = records
+            summary["temperature_results"][str(temperature)] = result
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -233,10 +289,23 @@ def parse_args():
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--audio-ablation", choices=("real", "zero", "shuffled", "stale"), default="real")
     parser.add_argument("--attention-temperature", type=float, default=None)
+    parser.add_argument(
+        "--attention-temperatures",
+        default="",
+        help="comma-separated inference temperatures; reuses visual/audio encoding",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     result = evaluate(parse_args())
-    print(json.dumps({key: value for key, value in result.items() if key != "records"}, indent=2))
+    printable = {key: value for key, value in result.items() if key != "records"}
+    if "temperature_results" in printable:
+        printable["temperature_results"] = {
+            temperature: {
+                key: value for key, value in temperature_result.items() if key != "records"
+            }
+            for temperature, temperature_result in printable["temperature_results"].items()
+        }
+    print(json.dumps(printable, indent=2))

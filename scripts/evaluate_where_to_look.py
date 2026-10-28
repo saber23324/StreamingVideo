@@ -11,6 +11,7 @@ import argparse
 import json
 import random
 import re
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -182,6 +183,24 @@ def overlay(ax, frame: np.ndarray, importance: np.ndarray, title: str):
     ax.axis("off")
 
 
+def format_question_answer(row, index: int) -> str:
+    """Render one MCQA row compactly enough to fit below a heatmap figure."""
+    question = " ".join(str(row.get("question", "")).split())
+    answer = str(row.get("answer", "")).strip()
+    options = row.get("options") or []
+    answer_text = ""
+    if answer and options:
+        answer_upper = answer.upper()
+        for option in options:
+            option_text = str(option)
+            if option_text[:2].upper() == f"{answer_upper}.":
+                answer_text = option_text
+                break
+    if answer_text:
+        answer = f"{answer} ({answer_text[2:].strip()})"
+    return f"Q{index}: {question}  A: {answer}".strip()
+
+
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -291,13 +310,27 @@ def main():
             teacher_importance, audio_importance, args.metric_topk
         )
         delta = vision_ce - audio_ce
-        representative = int(delta.argmax().item())
+        # The old implementation selected the frame with the largest
+        # vision-vs-audio CE delta.  That is a diagnostic score and is not
+        # tied to the question being displayed below the figure.  Select the
+        # frame with the strongest answer-conditioned teacher activation so
+        # the rendered frame and QA annotation refer to the same evidence.
+        representative = int(teacher_importance.max(dim=-1).values.argmax().item())
         record = {
             "dataset": dataset_name,
             "split": args.split_name,
             "video_id": video_id,
             "question_ids": [str(row.get("question_id", "")) for row in teacher_rows],
             "task_types": [str(row.get("task_type", "")) for row in teacher_rows],
+            "questions_answers": [
+                {
+                    "question_id": str(row.get("question_id", "")),
+                    "question": str(row.get("question", "")),
+                    "answer": str(row.get("answer", "")),
+                    "options": list(row.get("options") or []),
+                }
+                for row in teacher_rows
+            ],
             "query_boundary_seconds": query_boundary,
             "frames": int(len(frames)),
             "teacher_questions": len(teacher_maps),
@@ -313,10 +346,11 @@ def main():
             ),
             "representative_frame": representative,
             "representative_timestamp": float(timestamps[representative]),
+            "representative_selection": "teacher_max_token_importance",
         }
         records.append(record)
 
-        fig, axes = plt.subplots(1, 4, figsize=(16, 4.4))
+        fig, axes = plt.subplots(1, 4, figsize=(16, 5.4))
         axes[0].imshow(frames[representative])
         task_label = ", ".join(sorted(set(record["task_types"])))
         boundary_label = (
@@ -344,8 +378,24 @@ def main():
             f"CE improvement={record['cross_entropy_improvement']:.4f}",
             y=0.98,
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.88))
-        fig.savefig(figures_dir / f"{safe_figure_stem(video_id)}.png", dpi=160)
+        qa_lines = []
+        for index, row in enumerate(teacher_rows, start=1):
+            qa_lines.append("\n".join(textwrap.wrap(format_question_answer(row, index), width=190)))
+        fig.text(
+            0.5,
+            0.015,
+            "\n".join(qa_lines),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            wrap=True,
+        )
+        fig.tight_layout(rect=(0, 0.16, 1, 0.88))
+        question_suffix = safe_figure_stem(str(teacher_rows[0].get("question_id", "question")))
+        fig.savefig(
+            figures_dir / f"{safe_figure_stem(video_id)}__{question_suffix}.png",
+            dpi=160,
+        )
         plt.close(fig)
 
         del visual, audio, vision_attention, audio_attention, teacher_importance
